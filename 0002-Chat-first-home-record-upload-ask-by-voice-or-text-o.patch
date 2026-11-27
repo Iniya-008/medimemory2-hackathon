@@ -1,0 +1,1497 @@
+From ecacc5b0133d5eb74a53a40f01ec9b32191fcf2f Mon Sep 17 00:00:00 2001
+From: MediMemory team <team@medimemory.local>
+Date: Wed, 25 Nov 2026 17:54:52 +0000
+Subject: [PATCH 2/3] Chat-first home: record, upload, ask by voice or text on
+ one page; documents use the same review flow
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01URxMv78p3mykqFwFA9FPJW
+---
+ backend/app/api/visits.py              |  59 +++-
+ backend/app/core/llm.py                |   2 +-
+ backend/app/models/visits.py           |   4 +-
+ backend/app/services/visit_ai.py       |  15 +
+ backend/tests/test_visits_flow.py      |  27 ++
+ docs/FINALS_STAGING.md                 |   2 +-
+ frontend/src/App.jsx                   |  10 +-
+ frontend/src/components/VisitCards.jsx | 343 +++++++++++++++++++
+ frontend/src/hooks/useClips.js         |  80 +++++
+ frontend/src/hooks/useRecorder.js      | 103 ++++++
+ frontend/src/layouts/AppLayout.jsx     |  72 ++--
+ frontend/src/pages/ChatHome.jsx        | 456 +++++++++++++++++++++++++
+ frontend/src/test/chat.test.jsx        |  74 ++++
+ frontend/src/test/flows.test.jsx       |   2 +-
+ 14 files changed, 1215 insertions(+), 34 deletions(-)
+ create mode 100644 frontend/src/components/VisitCards.jsx
+ create mode 100644 frontend/src/hooks/useClips.js
+ create mode 100644 frontend/src/hooks/useRecorder.js
+ create mode 100644 frontend/src/pages/ChatHome.jsx
+ create mode 100644 frontend/src/test/chat.test.jsx
+
+diff --git a/backend/app/api/visits.py b/backend/app/api/visits.py
+index d7d0e4d..9dea10a 100644
+--- a/backend/app/api/visits.py
++++ b/backend/app/api/visits.py
+@@ -33,11 +33,12 @@ from app.core.deps import client_ip, get_current_user
+ from app.core.llm import LLMUnavailable
+ from app.core.ratelimit import limit
+ from app.database.session import get_db
+-from app.models import Consultation, DoctorInstruction, User, utcnow
++from app.models import Consultation, DoctorInstruction, MedicalDocument, User, utcnow
+ from app.models.visits import CATEGORIES, AudioClip, InstructionTranslation, Visit, VisitInstruction
+ from app.rag.indexer import index_source
+ from app.safety import TAMIL_TEXT_VERIFIED, classify, message
+-from app.services import visit_ai
++from app.services import extraction as docx
++from app.services import storage, visit_ai
+ from app.services.audit import audit
+ from app.voice import elevenlabs as el
+ 
+@@ -131,7 +132,7 @@ def _ins_out(ins: VisitInstruction) -> dict:
+ def _out(v: Visit) -> dict:
+     return {
+         "id": v.id, "doctor_name": v.doctor_name, "visit_date": v.visit_date.isoformat(), "status": v.status,
+-        "source": v.source, "recording_consent_at": v.recording_consent_at.isoformat() if v.recording_consent_at else None,
++        "source": v.source, "document_id": v.document_id, "text_method": v.text_method, "recording_consent_at": v.recording_consent_at.isoformat() if v.recording_consent_at else None,
+         "transcript": v.transcript, "transcript_language": v.transcript_language,
+         "extraction_method": v.extraction_method, "confirmed_at": v.confirmed_at.isoformat() if v.confirmed_at else None,
+         "instructions": [_ins_out(i) for i in v.instructions],
+@@ -204,7 +205,7 @@ async def record(request: Request, file: UploadFile = File(...), consent: bool =
+     # The audio itself is NOT stored; only the transcript, as a draft.
+     v = Visit(owner_id=user.id, doctor_name=doctor_name.strip()[:120], visit_date=visit_date or date.today(),
+               source="recording", recording_consent_at=utcnow(), consent_note=(consent_note or "")[:255] or None,
+-              transcript=result["text"], transcript_language=result.get("language_code"))
++              transcript=result["text"], transcript_language=result.get("language_code"), text_method="speech_to_text")
+     db.add(v)
+     db.flush()
+     audit(db, user.id, "visit.record", "visit", v.id, detail=f"{len(audio)} bytes, audio not stored", ip=client_ip(request))
+@@ -212,10 +213,54 @@ async def record(request: Request, file: UploadFile = File(...), consent: bool =
+     return _out(_get(db, user, v.id))
+ 
+ 
++@router.post("/document", status_code=201)
++async def from_document(request: Request, file: UploadFile = File(...), doctor_name: str = Form(""),
++                        visit_date: date | None = Form(None),
++                        user: User = Depends(limit("visit_document", 10)), db: Session = Depends(get_db)):
++    """A prescription / doctor's note becomes a draft visit, reviewed exactly like a recording."""
++    max_bytes = settings.max_upload_mb * 1024 * 1024
++    content = await file.read(max_bytes + 1)
++    if not content:
++        raise HTTPException(400, "The file is empty.")
++    if len(content) > max_bytes:
++        raise HTTPException(413, f"File is too large. Maximum size is {settings.max_upload_mb} MB.")
++    filename = (file.filename or "document").split("/")[-1].split("\\")[-1][:200]
++    mime = docx.sniff_mime(content, filename)
++    if mime not in docx.ALLOWED_TYPES:
++        raise HTTPException(415, "Please upload a PDF, photo (JPG/PNG/WEBP) or text file.")
++    res = docx.extract_text(content, mime)
++    text, method = res.text.strip(), res.method
++    if len(text) < 40 and mime != "text/plain" and settings.llm_enabled:
++        _ai_consent(user)
++        img, img_mime = content, mime
++        if mime == "application/pdf":
++            import pymupdf
++            img, img_mime = pymupdf.open(stream=content, filetype="pdf")[0].get_pixmap(dpi=170).tobytes("png"), "image/png"
++        try:
++            text, method = visit_ai.read_image(img, img_mime), "ai_vision"
++        except LLMUnavailable:
++            pass
++    if len(text) < 10:
++        raise HTTPException(422, "I couldn't read text from this file. Try a clearer, well-lit photo, or type the instructions.")
++    stored = storage.save_file(user.id, content, docx.ALLOWED_TYPES[mime])
++    doc = MedicalDocument(owner_id=user.id, title=(filename.rsplit(".", 1)[0] or "Document")[:200], doc_type="prescription",
++                          original_filename=filename, stored_filename=stored, mime_type=mime, size_bytes=len(content),
++                          status="pending_review", document_date=visit_date)
++    db.add(doc)
++    db.flush()
++    v = Visit(owner_id=user.id, doctor_name=doctor_name.strip()[:120], visit_date=visit_date or date.today(), source="document",
++              document_id=doc.id, transcript=text[:20000], text_method=method)
++    db.add(v)
++    db.flush()
++    audit(db, user.id, "visit.document", "visit", v.id, detail=f"{mime}, {len(content)} bytes, {method}", ip=client_ip(request))
++    db.commit()
++    return _out(_get(db, user, v.id))
++
++
+ @router.post("/typed", status_code=201)
+ def typed(body: TypedIn, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+     v = Visit(owner_id=user.id, doctor_name=body.doctor_name.strip(), visit_date=body.visit_date or date.today(),
+-              source=body.source, transcript=body.transcript.strip())
++              source=body.source, transcript=body.transcript.strip(), text_method="typed")
+     db.add(v)
+     db.flush()
+     audit(db, user.id, "visit.typed", "visit", v.id, ip=client_ip(request))
+@@ -285,6 +330,10 @@ def confirm(vid: int, request: Request, user: User = Depends(get_current_user),
+     db.add(c)
+     db.flush()
+     v.consultation_id, v.status, v.confirmed_at = c.id, "confirmed", utcnow()
++    if v.document_id:
++        d = db.get(MedicalDocument, v.document_id)
++        if d and d.owner_id == user.id:
++            d.status, d.consultation_id = "confirmed", c.id
+     for i in v.instructions:
+         i.needs_check = False
+     index_source(db, user.id, "consultation", c)
+diff --git a/backend/app/core/llm.py b/backend/app/core/llm.py
+index bd998da..efc7625 100644
+--- a/backend/app/core/llm.py
++++ b/backend/app/core/llm.py
+@@ -25,7 +25,7 @@ def _parse(raw: str) -> dict:
+         return json.loads(m.group(0))
+ 
+ 
+-def chat_json(system: str, user: str, timeout: float = 45) -> dict:
++def chat_json(system: str, user: str | list, timeout: float = 45) -> dict:
+     if not settings.llm_enabled:
+         raise LLMUnavailable("No LLM is configured on the server (set LLM_API_KEY, LLM_BASE_URL, LLM_MODEL).")
+     try:
+diff --git a/backend/app/models/visits.py b/backend/app/models/visits.py
+index a7fb7c9..879dc1e 100644
+--- a/backend/app/models/visits.py
++++ b/backend/app/models/visits.py
+@@ -20,7 +20,9 @@ class Visit(TimestampMixin, Base):
+     visit_date: Mapped[date] = mapped_column(Date, nullable=False)
+     # draft -> confirmed (or discarded = deleted). Nothing is usable by Ask until confirmed.
+     status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False)
+-    source: Mapped[str] = mapped_column(String(20), default="recording", nullable=False)  # recording | typed | sample
++    source: Mapped[str] = mapped_column(String(20), default="recording", nullable=False)  # recording | document | typed | sample
++    document_id: Mapped[int | None] = mapped_column(ForeignKey("mm_medical_documents.id", ondelete="SET NULL"))
++    text_method: Mapped[str | None] = mapped_column(String(20))  # speech_to_text | pdf_text | ocr | ai_vision | text | typed
+     recording_consent_at: Mapped[datetime | None] = mapped_column(DateTime)
+     consent_note: Mapped[str | None] = mapped_column(String(255))
+     transcript: Mapped[str] = mapped_column(Text, default="", nullable=False)
+diff --git a/backend/app/services/visit_ai.py b/backend/app/services/visit_ai.py
+index 26133f0..8c61764 100644
+--- a/backend/app/services/visit_ai.py
++++ b/backend/app/services/visit_ai.py
+@@ -117,6 +117,21 @@ def extract(transcript: str) -> tuple[str, str, list[dict]]:
+     return method, doctor, [check_item(i, transcript) for i in items][:30]
+ 
+ 
++# ------------------------------------------------------------------ reading a photo (no Tesseract on the server)
++READ_SYSTEM = """Transcribe the text in this medical document image exactly as written, line by line.
++Do not interpret, correct, summarise or add anything. If a word is unreadable write [unclear].
++Return JSON: {"text": "..."}"""
++
++
++def read_image(png_or_jpeg: bytes, mime: str) -> str:
++    """Raises LLMUnavailable. Output is only ever used as a draft the patient must review."""
++    import base64
++    url = f"data:{mime};base64,{base64.b64encode(png_or_jpeg).decode()}"
++    data = chat_json(READ_SYSTEM, [{"type": "text", "text": "Transcribe this document."},
++                                   {"type": "image_url", "image_url": {"url": url}}], timeout=60)
++    return str(data.get("text") or "").strip()
++
++
+ # ------------------------------------------------------------------ translation
+ TRANSLATE_SYSTEM = """Translate each medical instruction for an elderly patient into simple, spoken {lang}.
+ Rules: keep the meaning exactly; do not add or remove advice; keep medicine names in their original spelling;
+diff --git a/backend/tests/test_visits_flow.py b/backend/tests/test_visits_flow.py
+index 5052251..c762a40 100644
+--- a/backend/tests/test_visits_flow.py
++++ b/backend/tests/test_visits_flow.py
+@@ -246,3 +246,30 @@ def test_rate_limit_on_ask(client, auth, no_llm):
+     for _ in range(30):
+         client.post("/api/visits/ask", headers=auth, json={"question": "hello there"})
+     assert client.post("/api/visits/ask", headers=auth, json={"question": "hello there"}).status_code == 429
++
++
++# ---------------------------------------------------------------- documents go through the same review
++def test_document_upload_becomes_reviewable_visit(client, auth, no_llm):
++    note = ("Dr. Kavitha Rao, General Physician\nTake Metformin 500 mg after breakfast and after dinner.\n"
++            "Avoid sweets. Come back after one month.").encode()
++    v = client.post("/api/visits/document", headers=auth, files={"file": ("note.txt", note, "text/plain")}).json()
++    assert v["source"] == "document" and v["text_method"] == "text" and v["status"] == "draft" and v["document_id"]
++    v = client.post(f"/api/visits/{v['id']}/extract", headers=auth).json()
++    assert any("Metformin" in i["simple_text"] for i in v["instructions"])
++    v = client.post(f"/api/visits/{v['id']}/confirm", headers=auth).json()
++    doc = client.get(f"/api/documents/{v['document_id']}", headers=auth).json()
++    assert doc["status"] == "confirmed"
++
++
++def test_document_rejects_unknown_type(client, auth):
++    r = client.post("/api/visits/document", headers=auth, files={"file": ("x.exe", b"MZ\x90\x00binary", "application/octet-stream")})
++    assert r.status_code == 415
++
++
++def test_unreadable_image_without_llm_gives_clear_message(client, auth, no_llm):
++    import io
++    from PIL import Image
++    buf = io.BytesIO()
++    Image.new("RGB", (40, 40), "white").save(buf, "PNG")
++    r = client.post("/api/visits/document", headers=auth, files={"file": ("blank.png", buf.getvalue(), "image/png")})
++    assert r.status_code == 422 and "couldn't read" in r.json()["detail"].lower()
+diff --git a/docs/FINALS_STAGING.md b/docs/FINALS_STAGING.md
+index fd0466f..16a9f67 100644
+--- a/docs/FINALS_STAGING.md
++++ b/docs/FINALS_STAGING.md
+@@ -13,7 +13,7 @@
+    - LLM_MODEL = (current Flash model name shown in AI Studio)
+    - CORS_ORIGINS = (your staging Vercel URL, once you have it)
+ 4. Vercel -> Add New Project -> same repo, root `frontend`, **production branch `finals`** (Settings -> Git).
+-   Env: `VITE_API_URL` = the staging Render URL.
++   Env: `VITE_API_BASE` = the staging Render URL.
+ 5. Exit check (from the repo root, any laptop with Python):
+    `pip install httpx` then `python scripts/core_loop_check.py --base https://<staging>.onrender.com --lang ta`
+    Save `core_loop_results.json`: these are the real latency numbers for the pitch.
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index ee49ad8..b25a449 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -3,7 +3,7 @@ import { Loading } from "./components/ui";
+ import { useAuth } from "./context/AuthContext";
+ import AppLayout from "./layouts/AppLayout";
+ import Appointments from "./pages/Appointments";
+-import Assistant from "./pages/Assistant";
++import ChatHome from "./pages/ChatHome";
+ import Consultations from "./pages/Consultations";
+ import Dashboard from "./pages/Dashboard";
+ import DocumentDetail from "./pages/DocumentDetail";
+@@ -17,7 +17,6 @@ import Register from "./pages/Register";
+ import SettingsPage from "./pages/Settings";
+ import Timeline from "./pages/Timeline";
+ import Upload from "./pages/Upload";
+-import Voice from "./pages/Voice";
+ 
+ function Protected({ children }) {
+   const { user, loading } = useAuth();
+@@ -38,14 +37,15 @@ export default function App() {
+       <Route path="/login" element={<GuestOnly><Login /></GuestOnly>} />
+       <Route path="/register" element={<GuestOnly><Register /></GuestOnly>} />
+       <Route path="/app" element={<Protected><AppLayout /></Protected>}>
+-        <Route index element={<Dashboard />} />
++        <Route index element={<ChatHome />} />
++        <Route path="overview" element={<Dashboard />} />
+         <Route path="records" element={<Records />} />
+         <Route path="records/upload" element={<Upload />} />
+         <Route path="records/:id" element={<DocumentDetail />} />
+         <Route path="timeline" element={<Timeline />} />
+         <Route path="consultations" element={<Consultations />} />
+-        <Route path="assistant" element={<Assistant />} />
+-        <Route path="voice" element={<Voice />} />
++        <Route path="assistant" element={<Navigate to="/app" replace />} />
++        <Route path="voice" element={<Navigate to="/app" replace />} />
+         <Route path="medications" element={<Medications />} />
+         <Route path="appointments" element={<Appointments />} />
+         <Route path="family" element={<Family />} />
+diff --git a/frontend/src/components/VisitCards.jsx b/frontend/src/components/VisitCards.jsx
+new file mode 100644
+index 0000000..f164e98
+--- /dev/null
++++ b/frontend/src/components/VisitCards.jsx
+@@ -0,0 +1,343 @@
++import { useEffect, useRef, useState } from "react";
++import {
++  AlertTriangle, Check, CheckCircle2, ChevronDown, Circle, FileText, Loader2, Mic, Pause, Pencil, Phone, Play, Plus,
++  ShieldAlert, Stethoscope, Trash2, Volume2, X,
++} from "lucide-react";
++import { api, errorMessage, fmtDate } from "../services/api";
++
++export const CATEGORY = {
++  medicine: { label: "Medicine", ta: "மருந்து", tone: "bg-brand-50 text-brand-700" },
++  timing: { label: "Timing", ta: "நேரம்", tone: "bg-brand-50 text-brand-700" },
++  diet: { label: "Food", ta: "உணவு", tone: "bg-mint text-teal-700" },
++  test: { label: "Test", ta: "பரிசோதனை", tone: "bg-amber-50 text-amber-700" },
++  follow_up: { label: "Next visit", ta: "அடுத்த வருகை", tone: "bg-violet-50 text-violet-700" },
++  lifestyle: { label: "Daily habit", ta: "பழக்கம்", tone: "bg-mint text-teal-700" },
++  other: { label: "Other", ta: "மற்றவை", tone: "bg-canvas text-muted" },
++};
++const SOURCE = { recording: "Recorded visit", document: "Uploaded document", typed: "Typed notes", sample: "Sample visit (pre-written, not a real recording)" };
++const METHOD = { speech_to_text: "ElevenLabs speech-to-text", pdf_text: "PDF text", ocr: "OCR", ai_vision: "AI read the photo", text: "Text file", typed: "Typed" };
++
++export const audioPath = (iid, lang) => `/api/visits/instructions/${iid}/audio?lang=${lang}`;
++export const phrasePath = (kind, lang) => `/api/visits/phrases/${kind}/audio?lang=${lang}`;
++
++/* ------------------------------------------------------------------ small pieces */
++function PlayBtn({ path, clips, label = "Hear it", big }) {
++  const on = clips.playing === path, busy = clips.loading === path;
++  return (
++    <button onClick={() => clips.play(path)} aria-label={on ? "Stop" : label}
++      className={`inline-flex shrink-0 items-center justify-center gap-1.5 rounded-full font-semibold transition ${big ? "px-4 py-2 text-sm" : "px-3 py-1.5 text-xs"} ${on ? "bg-teal text-white" : "bg-teal-50 text-teal-700 hover:bg-teal-100"}`}>
++      {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : on ? <Pause className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
++      {on ? "Stop" : label}
++    </button>
++  );
++}
++
++function TranslationBadge({ t }) {
++  if (!t) return null;
++  return t.verified
++    ? <span className="chip bg-emerald-50 text-emerald-700"><CheckCircle2 className="h-3 w-3" /> Checked by {t.verified_by}</span>
++    : <span className="chip bg-amber-50 text-amber-700"><AlertTriangle className="h-3 w-3" /> Machine translation · not yet checked by a Tamil speaker</span>;
++}
++
++export function Steps({ steps, active, failed }) {
++  return (
++    <ol className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs" aria-label="Progress">
++      {steps.map((s, i) => {
++        const done = i < active, cur = i === active;
++        return (
++          <li key={s} className="flex items-center gap-2">
++            <span className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 font-semibold ${done ? "bg-teal-50 text-teal-700" : cur ? (failed ? "bg-red-50 text-red-700" : "bg-brand-50 text-brand-700") : "bg-canvas text-muted"}`}>
++              {done ? <Check className="h-3.5 w-3.5" /> : cur && !failed ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : cur ? <X className="h-3.5 w-3.5" /> : <Circle className="h-3 w-3" />}
++              {s}
++            </span>
++            {i < steps.length - 1 && <span className="h-px w-3 bg-line" />}
++          </li>
++        );
++      })}
++    </ol>
++  );
++}
++
++export function Bubble({ children, tone = "white" }) {
++  const t = { white: "bg-white border-line/80", red: "bg-red-50 border-red-200", amber: "bg-amber-50/70 border-amber-200", grey: "bg-canvas border-line" }[tone];
++  return <div className={`w-full rounded-2xl border p-4 shadow-sm sm:p-5 ${t}`}>{children}</div>;
++}
++
++/* ------------------------------------------------------------------ review (draft) */
++export function ReviewCard({ visit, onChange, onConfirmed, onDiscard, toast }) {
++  const [items, setItems] = useState(() => visit.instructions.map((i) => ({ ...i })));
++  const [doctor, setDoctor] = useState(visit.doctor_name || "");
++  const [date, setDate] = useState(visit.visit_date);
++  const [showText, setShowText] = useState(false);
++  const [busy, setBusy] = useState("");
++  useEffect(() => { setItems(visit.instructions.map((i) => ({ ...i }))); setDoctor(visit.doctor_name || ""); setDate(visit.visit_date); }, [visit]);
++
++  const set = (idx, patch) => setItems((xs) => xs.map((x, i) => (i === idx ? { ...x, ...patch } : x)));
++  const flagged = items.filter((i) => i.needs_check).length;
++
++  const openOriginal = async () => {
++    try {
++      const r = await api.get(`/api/documents/${visit.document_id}/file`, { responseType: "blob" });
++      window.open(URL.createObjectURL(r.data), "_blank", "noopener");
++    } catch (e) { toast.error(errorMessage(e)); }
++  };
++
++  const confirm = async () => {
++    setBusy("confirm");
++    try {
++      const body = { doctor_name: doctor, visit_date: date, instructions: items.filter((i) => i.simple_text.trim()).map((i) => ({
++        id: i.id || null, category: i.category, source_sentence: i.source_sentence || "", simple_text: i.simple_text.trim() })) };
++      await api.put(`/api/visits/${visit.id}/instructions`, body);
++      const r = await api.post(`/api/visits/${visit.id}/confirm`);
++      onChange(r.data);
++      onConfirmed(r.data);
++    } catch (e) { toast.error(errorMessage(e)); }
++    finally { setBusy(""); }
++  };
++
++  return (
++    <Bubble>
++      <div className="flex flex-wrap items-start justify-between gap-2">
++        <div>
++          <p className="text-base font-semibold text-ink">Please check what I understood</p>
++          <p className="text-xs text-muted">{SOURCE[visit.source]} · read with {METHOD[visit.text_method] || "—"} · nothing is saved until you confirm</p>
++        </div>
++        <span className="chip bg-amber-50 text-amber-700">Draft</span>
++      </div>
++
++      <div className="mt-3 grid gap-2 sm:grid-cols-2">
++        <label className="text-xs font-semibold text-muted">Doctor
++          <input className="input mt-1" value={doctor} onChange={(e) => setDoctor(e.target.value)} placeholder="e.g. Dr. Kavitha Rao" />
++        </label>
++        <label className="text-xs font-semibold text-muted">Visit date
++          <input type="date" className="input mt-1" value={date} onChange={(e) => setDate(e.target.value)} />
++        </label>
++      </div>
++
++      <div className="mt-3 flex flex-wrap gap-2">
++        <button className="btn-ghost px-2 py-1 text-xs" onClick={() => setShowText(!showText)}>
++          <ChevronDown className={`h-4 w-4 transition ${showText ? "rotate-180" : ""}`} /> {visit.source === "document" ? "What I read from the document" : "Full transcript"}
++        </button>
++        {visit.document_id && <button className="btn-ghost px-2 py-1 text-xs" onClick={openOriginal}><FileText className="h-4 w-4" /> View original</button>}
++      </div>
++      {showText && <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-xl bg-canvas p-3 text-xs text-ink">{visit.transcript}</pre>}
++
++      {flagged > 0 && (
++        <p className="mt-3 flex items-center gap-2 rounded-xl bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
++          <AlertTriangle className="h-4 w-4 shrink-0" /> {flagged} item{flagged > 1 ? "s need" : " needs"} a careful check against what the doctor said.
++        </p>
++      )}
++
++      <ul className="mt-3 space-y-3">
++        {items.map((it, idx) => (
++          <li key={it.id || `n${idx}`} className={`rounded-xl border p-3 ${it.needs_check ? "border-amber-300 bg-amber-50/40" : "border-line"}`}>
++            <div className="flex items-center gap-2">
++              <select className="rounded-lg border border-line bg-white px-2 py-1 text-xs font-semibold" value={it.category}
++                onChange={(e) => set(idx, { category: e.target.value })} aria-label="Category">
++                {Object.entries(CATEGORY).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
++              </select>
++              <span className="flex-1" />
++              <button className="rounded-lg p-1.5 text-muted hover:bg-red-50 hover:text-red-600" aria-label="Remove"
++                onClick={() => setItems((xs) => xs.filter((_, i) => i !== idx))}><Trash2 className="h-4 w-4" /></button>
++            </div>
++            <textarea className="input mt-2 min-h-[44px] text-[15px]" rows={2} value={it.simple_text}
++              onChange={(e) => set(idx, { simple_text: e.target.value, needs_check: false })} aria-label="Instruction" />
++            {it.source_sentence && <p className="mt-1.5 text-xs text-muted"><span className="font-semibold">Doctor said:</span> “{it.source_sentence}”</p>}
++            {it.needs_check && it.check_reason && <p className="mt-1.5 flex items-start gap-1.5 text-xs font-medium text-amber-800"><AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />{it.check_reason}</p>}
++          </li>
++        ))}
++      </ul>
++      <button className="btn-ghost mt-2 px-2 py-1 text-xs" onClick={() => setItems((xs) => [...xs, { category: "other", simple_text: "", source_sentence: "" }])}>
++        <Plus className="h-4 w-4" /> Add an instruction
++      </button>
++
++      <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-4">
++        <button className="btn-primary" disabled={busy || !items.some((i) => i.simple_text.trim())} onClick={confirm}>
++          {busy === "confirm" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />} Confirm &amp; save
++        </button>
++        <button className="btn-outline" disabled={!!busy} onClick={onDiscard}>Discard</button>
++      </div>
++    </Bubble>
++  );
++}
++
++/* ------------------------------------------------------------------ confirmed instructions */
++function TranslationEditor({ ins, lang, onSaved, toast }) {
++  const t = ins.translations?.[lang];
++  const [text, setText] = useState(t?.text || "");
++  const [reviewer, setReviewer] = useState(t?.verified_by || "");
++  const [verified, setVerified] = useState(!!t?.verified);
++  const [busy, setBusy] = useState(false);
++  const save = async () => {
++    setBusy(true);
++    try { onSaved((await api.put(`/api/visits/instructions/${ins.id}/translations/${lang}`, { text, verified, reviewer: reviewer || null })).data); }
++    catch (e) { toast.error(errorMessage(e)); }
++    finally { setBusy(false); }
++  };
++  return (
++    <div className="mt-2 space-y-2 rounded-xl bg-canvas p-3">
++      <textarea className="input text-[15px]" rows={2} value={text} onChange={(e) => setText(e.target.value)} />
++      <div className="flex flex-wrap items-center gap-2 text-xs">
++        <label className="flex items-center gap-1.5"><input type="checkbox" checked={verified} onChange={(e) => setVerified(e.target.checked)} /> Checked by a native Tamil speaker</label>
++        <input className="input w-44 py-1.5 text-xs" placeholder="Reviewer name" value={reviewer} onChange={(e) => setReviewer(e.target.value)} />
++        <button className="btn-primary px-3 py-1.5 text-xs" disabled={busy || !text.trim()} onClick={save}>Save</button>
++      </div>
++    </div>
++  );
++}
++
++export function InstructionsCard({ visit, lang, clips, onChange, toast, compact }) {
++  const [busy, setBusy] = useState(false);
++  const [open, setOpen] = useState({});
++  const [editing, setEditing] = useState(null);
++  const tried = useRef(false);
++  const missing = lang !== "en" && visit.instructions.some((i) => !i.translations?.[lang]);
++
++  const translate = async () => {
++    setBusy(true);
++    try { onChange((await api.post(`/api/visits/${visit.id}/translate`, { lang })).data); }
++    catch (e) { toast.error(errorMessage(e)); }
++    finally { setBusy(false); }
++  };
++  useEffect(() => { if (missing && !tried.current) { tried.current = true; translate(); } }, [missing]); // eslint-disable-line
++
++  const textOf = (i) => (lang === "en" ? i.simple_text : i.translations?.[lang]?.text);
++  const trs = visit.instructions.map((i) => i.translations?.[lang]).filter(Boolean);
++  const allUnverified = lang !== "en" && trs.length > 0 && trs.every((t) => !t.verified);
++  const allVerified = lang !== "en" && trs.length > 0 && trs.every((t) => t.verified);
++  const playable = visit.instructions.filter((i) => textOf(i));
++  const shown = compact ? visit.instructions.slice(0, 3) : visit.instructions;
++
++  return (
++    <Bubble>
++      <div className="flex flex-wrap items-center gap-3">
++        <span className="flex h-10 w-10 items-center justify-center rounded-full bg-teal-50 text-teal"><Stethoscope className="h-5 w-5" /></span>
++        <div className="min-w-0 flex-1">
++          <p className="font-semibold text-ink">{visit.doctor_name || "Your doctor"} · {fmtDate(visit.visit_date)}</p>
++          <p className="text-xs text-muted">{SOURCE[visit.source]} · <span className="font-semibold text-emerald-700">Confirmed by you</span></p>
++        </div>
++        {playable.length > 0 && (
++          <button className="btn-primary rounded-full px-4" onClick={() => clips.play(playable.map((i) => audioPath(i.id, lang)))}>
++            <Play className="h-4 w-4" /> {lang === "ta" ? "எல்லாம் கேளுங்கள்" : "Play all"}
++          </button>
++        )}
++      </div>
++      {allUnverified && <p className="mt-3"><TranslationBadge t={{ verified: false }} /></p>}
++      {allVerified && <p className="mt-3 chip bg-emerald-50 text-emerald-700"><CheckCircle2 className="h-3 w-3" /> Tamil checked by a native speaker</p>}
++      {missing && (
++        <p className="mt-3 flex items-center gap-2 text-sm text-muted">
++          {busy ? <><Loader2 className="h-4 w-4 animate-spin" /> Translating to தமிழ்…</> :
++            <button className="btn-outline px-3 py-1.5 text-xs" onClick={translate}>Translate to தமிழ்</button>}
++        </p>
++      )}
++      <ul className="mt-3 divide-y divide-line">
++        {shown.map((i) => {
++          const text = textOf(i), cat = CATEGORY[i.category] || CATEGORY.other;
++          return (
++            <li key={i.id} className="py-3">
++              <div className="flex items-start gap-3">
++                <span className={`chip mt-1 shrink-0 ${cat.tone}`}>{lang === "ta" ? cat.ta : cat.label}</span>
++                <p className={`min-w-0 flex-1 text-[17px] leading-relaxed ${text ? "text-ink" : "text-muted"}`}>{text || i.simple_text}</p>
++                {text && <PlayBtn path={audioPath(i.id, lang)} clips={clips} label={lang === "ta" ? "கேளுங்கள்" : "Hear it"} />}
++              </div>
++              <div className="ml-0 mt-1.5 flex flex-wrap items-center gap-2 sm:ml-[84px]">
++                {lang !== "en" && !allUnverified && !allVerified && <TranslationBadge t={i.translations?.[lang]} />}
++                <button className="text-xs font-semibold text-brand" onClick={() => setOpen((o) => ({ ...o, [i.id]: !o[i.id] }))}>
++                  {open[i.id] ? "Hide" : "What the doctor said"}
++                </button>
++                {lang !== "en" && i.translations?.[lang] && (
++                  <button className="inline-flex items-center gap-1 text-xs font-semibold text-muted" onClick={() => setEditing(editing === i.id ? null : i.id)}>
++                    <Pencil className="h-3 w-3" /> Review translation
++                  </button>
++                )}
++              </div>
++              {open[i.id] && (
++                <p className="mt-1.5 rounded-lg bg-canvas px-3 py-2 text-xs text-muted sm:ml-[84px]">
++                  “{i.source_sentence || i.simple_text}”{lang !== "en" && <><br /><span className="font-semibold">In simple English:</span> {i.simple_text}</>}
++                </p>
++              )}
++              {editing === i.id && (
++                <div className="sm:ml-[84px]"><TranslationEditor ins={i} lang={lang} toast={toast} onSaved={(ins) => {
++                  onChange({ ...visit, instructions: visit.instructions.map((x) => (x.id === ins.id ? ins : x)) });
++                  setEditing(null);
++                }} /></div>
++              )}
++            </li>
++          );
++        })}
++      </ul>
++      {compact && visit.instructions.length > 3 && <p className="text-xs text-muted">+ {visit.instructions.length - 3} more</p>}
++    </Bubble>
++  );
++}
++
++/* ------------------------------------------------------------------ answers */
++export function AnswerCard({ a, clips }) {
++  const lang = a.lang;
++  if (a.type === "emergency") {
++    return (
++      <Bubble tone="red">
++        <div className="flex items-start gap-3">
++          <ShieldAlert className="mt-0.5 h-7 w-7 shrink-0 text-red-600" />
++          <div className="flex-1">
++            <p className="text-lg font-semibold text-red-800">{a.message}</p>
++            <div className="mt-3 flex flex-wrap gap-2">
++              <a href="tel:108" className="btn-danger rounded-full px-5 text-base"><Phone className="h-5 w-5" /> Call 108</a>
++              <PlayBtn path={phrasePath("emergency", lang)} clips={clips} big label={lang === "ta" ? "கேளுங்கள்" : "Hear it"} />
++            </div>
++            <p className="mt-2 text-xs text-red-700/80">For emergencies MediMemory does not look at your records.</p>
++          </div>
++        </div>
++      </Bubble>
++    );
++  }
++  if (a.type === "refusal" || a.type === "not_found") {
++    return (
++      <Bubble tone={a.type === "refusal" ? "amber" : "grey"}>
++        <div className="flex items-start gap-3">
++          {a.type === "refusal" ? <ShieldAlert className="mt-0.5 h-6 w-6 shrink-0 text-amber-600" /> : <FileText className="mt-0.5 h-6 w-6 shrink-0 text-muted" />}
++          <div className="flex-1">
++            <p className="text-[16px] text-ink">{a.message}</p>
++            <div className="mt-2 flex flex-wrap items-center gap-2">
++              <PlayBtn path={phrasePath(a.phrase, lang)} clips={clips} label={lang === "ta" ? "கேளுங்கள்" : "Hear it"} />
++              {!a.message_verified && <span className="chip bg-amber-50 text-amber-700">Tamil wording not yet checked by a native speaker</span>}
++            </div>
++          </div>
++        </div>
++      </Bubble>
++    );
++  }
++  const first = a.matches[0];
++  return (
++    <Bubble>
++      <p className="text-xs font-semibold uppercase tracking-wide text-muted">
++        From your visit with {first.doctor_name || "your doctor"} · {fmtDate(first.visit_date)}
++      </p>
++      <ul className="mt-2 space-y-3">
++        {a.matches.map((m) => (
++          <li key={m.instruction_id} className="rounded-xl bg-canvas p-3">
++            <div className="flex items-start gap-3">
++              <p className="min-w-0 flex-1 text-[17px] leading-relaxed text-ink">{m.text}</p>
++              <PlayBtn path={audioPath(m.instruction_id, m.text_lang)} clips={clips} label={m.text_lang === "ta" ? "கேளுங்கள்" : "Hear it"} />
++            </div>
++            <p className="mt-2 text-xs text-muted"><span className="font-semibold">Source, what the doctor said:</span> “{m.source_sentence || m.english}”</p>
++            {m.text_lang === "ta" && !m.translation_verified && <span className="chip mt-2 bg-amber-50 text-amber-700"><AlertTriangle className="h-3 w-3" /> Machine translation · not yet checked</span>}
++          </li>
++        ))}
++      </ul>
++      <p className="mt-2 text-[11px] text-muted">Answered only from instructions you confirmed · {a.timing_ms} ms</p>
++    </Bubble>
++  );
++}
++
++export function UserBubble({ m, onEdit }) {
++  return (
++    <div className="ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-navy px-4 py-3 text-[15px] text-white shadow-sm">
++      {m.kind === "voice" && <span className="mb-1 flex items-center gap-1 text-[11px] font-semibold text-sky-200"><Mic className="h-3 w-3" /> Heard</span>}
++      {m.kind === "file" && <span className="mb-1 flex items-center gap-1 text-[11px] font-semibold text-sky-200"><FileText className="h-3 w-3" /> Document</span>}
++      {m.kind === "record" && <span className="mb-1 flex items-center gap-1 text-[11px] font-semibold text-sky-200"><Mic className="h-3 w-3" /> Doctor visit recording</span>}
++      <p className="whitespace-pre-wrap">{m.text}</p>
++      {m.kind === "voice" && onEdit && <button className="mt-1 text-[11px] font-semibold text-sky-200 underline" onClick={() => onEdit(m.text)}>Not right? Edit and ask again</button>}
++    </div>
++  );
++}
+diff --git a/frontend/src/hooks/useClips.js b/frontend/src/hooks/useClips.js
+new file mode 100644
+index 0000000..d664d94
+--- /dev/null
++++ b/frontend/src/hooks/useClips.js
+@@ -0,0 +1,80 @@
++import { useCallback, useEffect, useRef, useState } from "react";
++import { api, blobErrorMessage } from "../services/api";
++
++/**
++ * Plays cached ElevenLabs clips served by the backend (auth header required, so we fetch blobs).
++ * key = a URL path like /api/visits/instructions/12/audio?lang=ta
++ */
++export function useClips(onError) {
++  const cache = useRef(new Map());
++  const audio = useRef(null);
++  const queue = useRef([]);
++  const [playing, setPlaying] = useState(null);
++  const [loading, setLoading] = useState(null);
++  const lastWarn = useRef(0);
++  const warn = (msg) => { if (Date.now() - lastWarn.current > 8000) { lastWarn.current = Date.now(); onError?.(msg); } };
++
++  useEffect(() => () => {
++    audio.current?.pause();
++    cache.current.forEach((u) => URL.revokeObjectURL(u));
++  }, []);
++
++  const stop = useCallback(() => {
++    queue.current = [];
++    audio.current?.pause();
++    setPlaying(null);
++  }, []);
++
++  const fetchUrl = useCallback(async (path) => {
++    let url = cache.current.get(path);
++    if (!url) {
++      const r = await api.get(path, { responseType: "blob" });
++      url = URL.createObjectURL(r.data);
++      cache.current.set(path, url);
++    }
++    return url;
++  }, []);
++
++  const playOne = useCallback(async (path) => {
++    setLoading(path);
++    try {
++      const url = await fetchUrl(path);
++      setLoading(null);
++      await new Promise((resolve) => {
++        const a = new Audio(url);
++        audio.current?.pause();
++        audio.current = a;
++        a.onended = resolve;
++        a.onpause = resolve;
++        setPlaying(path);
++        a.onerror = () => { warn("This audio couldn't be played. Please try again."); resolve(); };
++        a.play().catch((err) => {
++          warn(err?.name === "NotAllowedError" ? "Tap the play button to hear it (your browser blocked autoplay)." : "This audio couldn't be played. Please try again.");
++          resolve();
++        });
++      });
++    } catch (e) {
++      setLoading(null);
++      warn(await blobErrorMessage(e, "Couldn't play the audio."));
++      queue.current = [];
++    } finally {
++      setPlaying((p) => (p === path ? null : p));
++    }
++  }, [fetchUrl, onError]);
++
++  /** Play one path, or several in order. Pressing the same single path again stops it. */
++  const play = useCallback(async (paths) => {
++    const list = Array.isArray(paths) ? paths : [paths];
++    if (list.length === 1 && playing === list[0]) { stop(); return; }
++    stop();
++    queue.current = [...list];
++    while (queue.current.length) {
++      const next = queue.current.shift();
++      await playOne(next);
++    }
++  }, [playOne, playing, stop]);
++
++  const prefetch = useCallback((paths) => { paths.forEach((p) => fetchUrl(p).catch(() => {})); }, [fetchUrl]);
++
++  return { play, stop, prefetch, playing, loading };
++}
+diff --git a/frontend/src/hooks/useRecorder.js b/frontend/src/hooks/useRecorder.js
+new file mode 100644
+index 0000000..0ce22b4
+--- /dev/null
++++ b/frontend/src/hooks/useRecorder.js
+@@ -0,0 +1,103 @@
++import { useCallback, useEffect, useRef, useState } from "react";
++
++function pickMime() {
++  if (typeof MediaRecorder === "undefined") return "";
++  return ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"].find((t) => MediaRecorder.isTypeSupported?.(t)) || "";
++}
++
++/** Microphone recorder with live level meter. stop() resolves to a Blob (or null if cancelled). */
++export function useRecorder({ maxSeconds = 600, bars = 24 } = {}) {
++  const [state, setState] = useState("idle"); // idle | starting | recording
++  const [seconds, setSeconds] = useState(0);
++  const [levels, setLevels] = useState(() => Array(bars).fill(0.08));
++  const [error, setError] = useState("");
++  const rec = useRef(null);
++  const chunks = useRef([]);
++  const stream = useRef(null);
++  const ctx = useRef(null);
++  const raf = useRef(null);
++  const timer = useRef(null);
++  const resolver = useRef(null);
++  const cancelled = useRef(false);
++
++  const cleanup = useCallback(() => {
++    cancelAnimationFrame(raf.current);
++    clearInterval(timer.current);
++    stream.current?.getTracks().forEach((t) => t.stop());
++    stream.current = null;
++    ctx.current?.close().catch(() => {});
++    ctx.current = null;
++    setLevels(Array(bars).fill(0.08));
++  }, [bars]);
++
++  useEffect(() => () => cleanup(), [cleanup]);
++
++  const start = useCallback(async () => {
++    setError("");
++    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
++      setError("This browser can't record audio. Please type instead, or use Chrome on your phone.");
++      return false;
++    }
++    setState("starting");
++    try {
++      stream.current = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
++    } catch (e) {
++      setState("idle");
++      setError(e?.name === "NotAllowedError"
++        ? "Microphone permission was blocked. Allow the microphone in your browser's address bar, then try again."
++        : "No microphone was found. Please connect one, or type instead.");
++      return false;
++    }
++    const mime = pickMime();
++    const r = new MediaRecorder(stream.current, mime ? { mimeType: mime } : undefined);
++    chunks.current = [];
++    cancelled.current = false;
++    r.ondataavailable = (e) => e.data.size && chunks.current.push(e.data);
++    r.onstop = () => {
++      const blob = cancelled.current ? null : new Blob(chunks.current, { type: r.mimeType || "audio/webm" });
++      cleanup();
++      setState("idle");
++      resolver.current?.(blob);
++      resolver.current = null;
++    };
++    try {
++      const AC = window.AudioContext || window.webkitAudioContext;
++      ctx.current = new AC();
++      const an = ctx.current.createAnalyser();
++      an.fftSize = 256;
++      ctx.current.createMediaStreamSource(stream.current).connect(an);
++      const buf = new Uint8Array(an.frequencyBinCount);
++      const loop = () => {
++        an.getByteFrequencyData(buf);
++        const step = Math.floor(buf.length / bars);
++        setLevels(Array.from({ length: bars }, (_, i) => Math.min(1, (buf[i * step] || 0) / 200 + 0.06)));
++        raf.current = requestAnimationFrame(loop);
++      };
++      loop();
++    } catch { /* level meter is optional */ }
++    r.start(250);
++    rec.current = r;
++    setSeconds(0);
++    timer.current = setInterval(() => setSeconds((s) => {
++      if (s + 1 >= maxSeconds) rec.current?.state === "recording" && rec.current.stop();
++      return s + 1;
++    }), 1000);
++    setState("recording");
++    return true;
++  }, [bars, cleanup, maxSeconds]);
++
++  const stop = useCallback(() => new Promise((resolve) => {
++    if (!rec.current || rec.current.state !== "recording") { resolve(null); return; }
++    resolver.current = resolve;
++    rec.current.stop();
++  }), []);
++
++  const cancel = useCallback(() => {
++    cancelled.current = true;
++    if (rec.current?.state === "recording") rec.current.stop(); else cleanup();
++  }, [cleanup]);
++
++  return { state, seconds, levels, error, setError, start, stop, cancel };
++}
++
++export const mmss = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+diff --git a/frontend/src/layouts/AppLayout.jsx b/frontend/src/layouts/AppLayout.jsx
+index d0ccc9b..a457ed2 100644
+--- a/frontend/src/layouts/AppLayout.jsx
++++ b/frontend/src/layouts/AppLayout.jsx
+@@ -1,34 +1,66 @@
+ import { useEffect, useRef, useState } from "react";
+ import { Link, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+ import {
+-  Activity, AudioLines, Bell, Bot, CalendarDays, FileText, HeartHandshake, House, LogOut, Menu, Pill, Search, Settings, Stethoscope, X,
++  Bell, FileText, HeartHandshake, LayoutGrid, LogOut, Menu, MessageCircle, Pill, Search, Settings, SquarePen, Stethoscope, X,
+ } from "lucide-react";
+-import { HeartBadge } from "../components/illustrations";
+ import { Logo, Spinner } from "../components/ui";
+ import { useAuth } from "../context/AuthContext";
+ import { useToast } from "../context/ToastContext";
+-import { api, errorMessage, fmtTime } from "../services/api";
++import { api, errorMessage, fmtDate, fmtTime } from "../services/api";
+ 
+ export const NAV = [
+-  { to: "/app", label: "Overview", icon: House, end: true },
+-  { to: "/app/records", label: "Medical Records", icon: FileText },
+-  { to: "/app/timeline", label: "Health Timeline", icon: Activity },
+-  { to: "/app/consultations", label: "Consultations", icon: Stethoscope },
+-  { to: "/app/assistant", label: "AI Assistant", icon: Bot },
+-  { to: "/app/voice", label: "Voice Assistant", icon: AudioLines },
+-  { to: "/app/medications", label: "Medications", icon: Pill },
+-  { to: "/app/appointments", label: "Appointments", icon: CalendarDays },
+-  { to: "/app/family", label: "Family Access", icon: HeartHandshake },
++  { to: "/app", label: "Chat", icon: MessageCircle, end: true },
++  { to: "/app/medications", label: "Medicines & reminders", icon: Pill },
++  { to: "/app/records", label: "Documents", icon: FileText },
++  { to: "/app/family", label: "Family access", icon: HeartHandshake },
++  { to: "/app/overview", label: "Overview", icon: LayoutGrid },
+   { to: "/app/settings", label: "Settings", icon: Settings },
+ ];
+ 
++/** Chat-style history: the patient's visits (recorded or uploaded), newest first. */
++function VisitHistory({ onNavigate }) {
++  const [items, setItems] = useState([]);
++  const navigate = useNavigate();
++  useEffect(() => {
++    const load = () => api.get("/api/visits").then((r) => setItems(r.data)).catch(() => {});
++    load();
++    window.addEventListener("mm:visits-changed", load);
++    return () => window.removeEventListener("mm:visits-changed", load);
++  }, []);
++  if (!items.length) return null;
++  return (
++    <div className="mt-5 px-3">
++      <p className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-navy-100/70">Your visits</p>
++      <ul className="space-y-0.5">
++        {items.slice(0, 12).map((v) => (
++          <li key={v.id}>
++            <button onClick={() => { navigate(`/app?visit=${v.id}`); onNavigate?.(); }}
++              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] text-navy-100 hover:bg-white/5 hover:text-white">
++              <Stethoscope className="h-3.5 w-3.5 shrink-0 opacity-70" />
++              <span className="min-w-0 flex-1 truncate">{v.doctor_name || "Doctor visit"} · {fmtDate(v.visit_date, { day: "2-digit", month: "short" })}</span>
++              {v.status !== "confirmed" && <span className="rounded bg-amber-400/20 px-1.5 text-[10px] font-semibold text-amber-200">draft</span>}
++            </button>
++          </li>
++        ))}
++      </ul>
++    </div>
++  );
++}
++
+ function Sidebar({ onNavigate }) {
+   const { logout } = useAuth();
+   const navigate = useNavigate();
+   return (
+     <div className="flex h-full flex-col bg-navy text-white">
+-      <div className="px-5 pb-6 pt-6"><Logo light /></div>
+-      <nav className="flex-1 space-y-1 overflow-y-auto px-3" aria-label="Main navigation">
++      <div className="px-5 pb-4 pt-6"><Logo light /></div>
++      <div className="px-3 pb-3">
++        <button onClick={() => { navigate("/app"); window.dispatchEvent(new Event("mm:new-chat")); onNavigate?.(); }}
++          className="flex w-full items-center gap-2 rounded-xl border border-white/15 px-3.5 py-2.5 text-sm font-semibold text-white hover:bg-white/10">
++          <SquarePen className="h-4 w-4" /> New chat
++        </button>
++      </div>
++      <div className="flex-1 overflow-y-auto">
++      <nav className="space-y-1 px-3" aria-label="Main navigation">
+         {NAV.map(({ to, label, icon: Icon, end }) => (
+           <NavLink key={to} to={to} end={end} onClick={onNavigate}
+             className={({ isActive }) => `flex items-center gap-3 rounded-xl px-3.5 py-2.5 text-sm font-medium transition ${isActive ? "bg-teal text-white shadow-lg shadow-teal/25" : "text-navy-100 hover:bg-white/5 hover:text-white"}`}>
+@@ -36,12 +68,10 @@ function Sidebar({ onNavigate }) {
+           </NavLink>
+         ))}
+       </nav>
++      <VisitHistory onNavigate={onNavigate} />
++      </div>
+       <div className="space-y-3 p-4">
+-        <div className="relative overflow-hidden rounded-2xl bg-white/5 p-4 ring-1 ring-white/10">
+-          <p className="text-sm font-semibold leading-snug">Your Health.<br />Our Priority <span className="text-sky-300">♥</span></p>
+-          <p className="mt-1 text-[11px] text-navy-100">Answers come only from your own records.</p>
+-          <HeartBadge className="absolute -bottom-2 -right-2 h-14 w-14 opacity-30" />
+-        </div>
++        <p className="rounded-xl bg-white/5 px-3 py-2 text-[11px] leading-snug text-navy-100 ring-1 ring-white/10">Answers come only from instructions you confirmed. Not a doctor. Emergency: call 108.</p>
+         <button className="flex w-full items-center gap-3 rounded-xl px-3.5 py-2.5 text-sm text-navy-100 hover:bg-white/5 hover:text-white"
+           onClick={async () => { await logout(); navigate("/login"); }}>
+           <LogOut className="h-[18px] w-[18px]" /> Logout
+@@ -176,6 +206,7 @@ export default function AppLayout() {
+   const loc = useLocation();
+   useEffect(() => setOpen(false), [loc.pathname]);
+   const current = NAV.find((n) => (n.end ? loc.pathname === n.to : loc.pathname.startsWith(n.to)));
++  const isChat = loc.pathname === "/app" || loc.pathname === "/app/";
+   return (
+     <div className="min-h-screen lg:flex">
+       <aside className="sticky top-0 hidden h-screen w-64 shrink-0 lg:block"><Sidebar /></aside>
+@@ -195,7 +226,8 @@ export default function AppLayout() {
+           <ReminderBell />
+           <Link to="/app/settings" aria-label="Profile and settings" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-navy text-sm font-semibold text-white ring-4 ring-brand-50">{initials(user?.full_name)}</Link>
+         </header>
+-        <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8"><Outlet /></main>
++        {isChat ? <main><Outlet /></main>
++          : <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8"><Outlet /></main>}
+       </div>
+       <ReminderPoller />
+     </div>
+diff --git a/frontend/src/pages/ChatHome.jsx b/frontend/src/pages/ChatHome.jsx
+new file mode 100644
+index 0000000..d585ef6
+--- /dev/null
++++ b/frontend/src/pages/ChatHome.jsx
+@@ -0,0 +1,456 @@
++import { useCallback, useEffect, useRef, useState } from "react";
++import { useNavigate, useSearchParams } from "react-router-dom";
++import { ArrowUp, FileText, Loader2, Mic, Paperclip, Plus, ShieldCheck, Sparkles, Square, Stethoscope, Upload, X } from "lucide-react";
++import {
++  AnswerCard, Bubble, InstructionsCard, ReviewCard, Steps, UserBubble, audioPath, phrasePath,
++} from "../components/VisitCards";
++import { useAuth } from "../context/AuthContext";
++import { useToast } from "../context/ToastContext";
++import { useClips } from "../hooks/useClips";
++import { mmss, useRecorder } from "../hooks/useRecorder";
++import { api, errorMessage, todayISO } from "../services/api";
++
++const VISIT_STEPS = ["Recording", "ElevenLabs speech-to-text", "AI finds the instructions", "Your check"];
++const DOC_STEPS = ["Uploading", "Reading the document", "AI finds the instructions", "Your check"];
++const SAMPLE_STEPS = ["Sample transcript (pre-written)", "No recording needed", "AI finds the instructions", "Your check"];
++const ASK_STEPS_VOICE = ["Heard you · ElevenLabs", "Safety check", "Your confirmed instructions", "Voice · ElevenLabs"];
++const SAMPLE_VISIT = (
++  "[SAMPLE — pre-written for demonstration, not a real consultation]\n" +
++  "Doctor: Lakshmi amma, your sugar and BP readings are a little high this time. " +
++  "Take Metformin 500 mg, one tablet after breakfast and one after dinner. " +
++  "Take Amlodipine 5 mg once in the morning. " +
++  "Avoid sweets and reduce rice at night. " +
++  "Walk for 30 minutes every evening. " +
++  "Do an HbA1c blood test before the next visit. " +
++  "Come back after one month."
++);
++const SUGGEST = {
++  en: ["When should I take my sugar tablet?", "What did the doctor say about food?", "When is my next visit?"],
++  ta: ["சர்க்கரை மாத்திரை எப்போது சாப்பிடணும்?", "சாப்பாடு பற்றி டாக்டர் என்ன சொன்னார்?", "அடுத்த முறை எப்போது வரணும்?"],
++};
++
++let seq = 0;
++const nid = () => `${Date.now()}-${seq++}`;
++const visitsChanged = () => window.dispatchEvent(new Event("mm:visits-changed"));
++
++export default function ChatHome() {
++  const { user, setUser } = useAuth();
++  const toast = useToast();
++  const navigate = useNavigate();
++  const [params, setParams] = useSearchParams();
++  const storeKey = `mm_thread_${user.id}`;
++  const [lang, setLang] = useState(() => {
++    try { return localStorage.getItem("mm_lang") || (user.profile?.preferred_language === "ta" ? "ta" : "en"); } catch { return "en"; }
++  });
++  const [thread, setThread] = useState(() => {
++    try { return JSON.parse(sessionStorage.getItem(storeKey) || "[]").filter((m) => !["progress", "recordSetup"].includes(m.kind)); } catch { return []; }
++  });
++  const [visits, setVisits] = useState({});
++  const [input, setInput] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [menu, setMenu] = useState(false);
++  const [drag, setDrag] = useState(false);
++  const recMode = useRef(null); // "visit" | "question"
++  const recSetupId = useRef(null);
++  const fileRef = useRef(null);
++  const endRef = useRef(null);
++  const inputRef = useRef(null);
++  const rec = useRecorder({ maxSeconds: 900 });
++  const onClipError = useCallback((m) => toast.info(m), [toast]);
++  const clips = useClips(onClipError);
++  const consent = !!user.profile?.ai_data_consent;
++  const firstName = (user.full_name || "").split(" ")[0];
++
++  const menuRef = useRef(null);
++  useEffect(() => {
++    if (!menu) return undefined;
++    const close = (e) => { if (menuRef.current && !menuRef.current.contains(e.target)) setMenu(false); };
++    const esc = (e) => e.key === "Escape" && setMenu(false);
++    document.addEventListener("mousedown", close);
++    document.addEventListener("keydown", esc);
++    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", esc); };
++  }, [menu]);
++  useEffect(() => { try { localStorage.setItem("mm_lang", lang); } catch { /* ignore */ } }, [lang]);
++  useEffect(() => { try { sessionStorage.setItem(storeKey, JSON.stringify(thread.slice(-60))); } catch { /* ignore */ } }, [thread, storeKey]);
++  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [thread.length, rec.state]);
++  useEffect(() => { if (rec.error) { toast.error(rec.error); rec.setError(""); } }, [rec.error]); // eslint-disable-line
++
++  const loadVisits = useCallback(async () => {
++    try {
++      const list = (await api.get("/api/visits")).data;
++      setVisits(Object.fromEntries(list.map((v) => [v.id, v])));
++      return list;
++    } catch { return []; }
++  }, []);
++  useEffect(() => { loadVisits(); }, [loadVisits]);
++
++  // Opening a visit from the sidebar: /app?visit=12
++  useEffect(() => {
++    const id = Number(params.get("visit"));
++    if (!id) return;
++    setParams({}, { replace: true });
++    api.get(`/api/visits/${id}`).then((r) => {
++      putVisit(r.data);
++      push({ role: "assistant", kind: r.data.status === "confirmed" ? "visit" : "review", visitId: id });
++    }).catch((e) => toast.error(errorMessage(e)));
++  }, [params]); // eslint-disable-line
++  useEffect(() => {
++    const clear = () => { setThread([]); clips.stop(); };
++    window.addEventListener("mm:new-chat", clear);
++    return () => window.removeEventListener("mm:new-chat", clear);
++  }, [clips]);
++
++  const push = (m) => { const msg = { id: nid(), ...m }; setThread((t) => [...t, msg]); return msg.id; };
++  const update = (id, patch) => setThread((t) => t.map((m) => (m.id === id ? { ...m, ...patch } : m)));
++  const remove = (id) => setThread((t) => t.filter((m) => m.id !== id));
++  const putVisit = (v) => setVisits((vs) => ({ ...vs, [v.id]: v }));
++
++  const enableConsent = async () => {
++    try {
++      const r = await api.patch("/api/auth/me", { ai_data_consent: true });
++      setUser(r.data);
++      toast.success("AI and voice features are on. You can turn this off any time in Settings.");
++    } catch (e) { toast.error(errorMessage(e)); }
++  };
++  const needConsent = () => {
++    if (consent) return false;
++    push({ role: "assistant", kind: "consent" });
++    return true;
++  };
++
++  /* -------------------------------------------------------------- shared: draft -> extract -> review */
++  const extractAndReview = async (visit, progressId, steps) => {
++    update(progressId, { active: 2 });
++    const v = (await api.post(`/api/visits/${visit.id}/extract`)).data;
++    putVisit(v);
++    update(progressId, { active: steps.length, note: v.extraction_method === "rules" ? "AI is not configured, so simple rules were used. Check carefully." : null });
++    push({ role: "assistant", kind: "review", visitId: v.id });
++    visitsChanged();
++  };
++
++  /* -------------------------------------------------------------- record a doctor visit */
++  const openRecordSetup = () => {
++    setMenu(false);
++    if (needConsent()) return;
++    recSetupId.current = push({ role: "assistant", kind: "recordSetup", doctor: "", agreed: false });
++  };
++  const startVisitRecording = async (setupId) => {
++    recMode.current = "visit";
++    recSetupId.current = setupId;
++    const ok = await rec.start();
++    if (!ok) recMode.current = null;
++  };
++  const finishVisitRecording = async () => {
++    const setup = thread.find((m) => m.id === recSetupId.current);
++    const secs = rec.seconds;
++    const blob = await rec.stop();
++    recMode.current = null;
++    if (!blob) return;
++    remove(recSetupId.current);
++    push({ role: "user", kind: "record", text: `Recorded ${mmss(secs)}${setup?.doctor ? ` with ${setup.doctor}` : ""}` });
++    const pid = push({ role: "assistant", kind: "progress", steps: VISIT_STEPS, active: 1 });
++    setBusy(true);
++    try {
++      const fd = new FormData();
++      fd.append("file", blob, `visit.${blob.type.includes("mp4") ? "m4a" : "webm"}`);
++      fd.append("consent", "true");
++      fd.append("consent_note", "Everyone in the room agreed to the recording");
++      fd.append("doctor_name", setup?.doctor || "");
++      fd.append("visit_date", todayISO());
++      const v = (await api.post("/api/visits/record", fd)).data;
++      putVisit(v);
++      await extractAndReview(v, pid, VISIT_STEPS);
++    } catch (e) {
++      update(pid, { failed: true, note: errorMessage(e) });
++    } finally { setBusy(false); }
++  };
++
++  /* -------------------------------------------------------------- upload a document */
++  const uploadFile = async (file) => {
++    setMenu(false);
++    if (!file) return;
++    if (needConsent()) return;
++    push({ role: "user", kind: "file", text: file.name });
++    const pid = push({ role: "assistant", kind: "progress", steps: DOC_STEPS, active: 0 });
++    setBusy(true);
++    try {
++      const fd = new FormData();
++      fd.append("file", file);
++      fd.append("visit_date", todayISO());
++      update(pid, { active: 1 });
++      const v = (await api.post("/api/visits/document", fd)).data;
++      putVisit(v);
++      await extractAndReview(v, pid, DOC_STEPS);
++    } catch (e) {
++      update(pid, { failed: true, note: errorMessage(e) });
++    } finally { setBusy(false); if (fileRef.current) fileRef.current.value = ""; }
++  };
++
++  const runSample = async () => {
++    setMenu(false);
++    push({ role: "user", kind: "text", text: "Show me with a sample visit" });
++    const pid = push({ role: "assistant", kind: "progress", steps: SAMPLE_STEPS, active: 1 });
++    setBusy(true);
++    try {
++      const v = (await api.post("/api/visits/typed", { transcript: SAMPLE_VISIT, doctor_name: "Dr. Kavitha Rao", source: "sample" })).data;
++      putVisit(v);
++      await extractAndReview(v, pid, SAMPLE_STEPS);
++    } catch (e) { update(pid, { failed: true, note: errorMessage(e) }); }
++    finally { setBusy(false); }
++  };
++
++  /* -------------------------------------------------------------- ask */
++  const ask = async (text, kind = "text") => {
++    const q = text.trim();
++    if (!q || busy) return;
++    setInput("");
++    push({ role: "user", kind, text: q });
++    const pid = push({ role: "assistant", kind: "progress", steps: kind === "voice" ? ASK_STEPS_VOICE : ASK_STEPS_VOICE.slice(1, 3), active: kind === "voice" ? 1 : 0 });
++    setBusy(true);
++    try {
++      const a = (await api.post("/api/visits/ask", { question: q, lang })).data;
++      remove(pid);
++      push({ role: "assistant", kind: "answer", a });
++      if (consent) {
++        const path = a.matches?.length ? audioPath(a.matches[0].instruction_id, a.matches[0].text_lang) : phrasePath(a.phrase, lang);
++        clips.play(path);
++      }
++    } catch (e) {
++      update(pid, { failed: true, note: errorMessage(e) });
++    } finally { setBusy(false); }
++  };
++
++  const startQuestion = async () => {
++    if (needConsent()) return;
++    clips.stop();
++    recMode.current = "question";
++    const ok = await rec.start();
++    if (!ok) recMode.current = null;
++  };
++  const finishQuestion = async () => {
++    const blob = await rec.stop();
++    recMode.current = null;
++    if (!blob) return;
++    setBusy(true);
++    const pid = push({ role: "assistant", kind: "progress", steps: ASK_STEPS_VOICE, active: 0 });
++    try {
++      const fd = new FormData();
++      fd.append("file", blob, `question.${blob.type.includes("mp4") ? "m4a" : "webm"}`);
++      const heard = (await api.post("/api/voice/transcribe", fd)).data.text;
++      remove(pid);
++      setBusy(false);
++      await ask(heard, "voice");
++    } catch (e) {
++      update(pid, { failed: true, note: errorMessage(e) });
++      setBusy(false);
++    }
++  };
++
++  const discard = async (visitId, msgId) => {
++    try { await api.delete(`/api/visits/${visitId}`); } catch { /* already gone */ }
++    remove(msgId);
++    push({ role: "assistant", kind: "note", text: "Discarded. Nothing was saved." });
++    visitsChanged();
++  };
++
++  /* -------------------------------------------------------------- render */
++  const recordingQuestion = rec.state !== "idle" && recMode.current === "question";
++  const lastConfirmed = Object.values(visits).filter((v) => v.status === "confirmed").sort((a, b) => (a.visit_date < b.visit_date ? 1 : -1))[0];
++
++  const renderMsg = (m) => {
++    if (m.role === "user") return <UserBubble m={m} onEdit={(t) => { setInput(t); inputRef.current?.focus(); }} />;
++    switch (m.kind) {
++      case "progress":
++        return (
++          <Bubble tone={m.failed ? "red" : "white"}>
++            <Steps steps={m.steps} active={m.active} failed={m.failed} />
++            {m.note && <p className={`mt-2 text-sm ${m.failed ? "text-red-700" : "text-muted"}`}>{m.note}</p>}
++          </Bubble>
++        );
++      case "consent":
++        return (
++          <Bubble tone="amber">
++            <p className="font-semibold text-ink">One permission first</p>
++            <p className="mt-1 text-sm text-ink/80">To record, read documents and speak answers, MediMemory sends audio and text to ElevenLabs (voice) and an AI service (understanding and translation). Only synthetic demo data should be used.</p>
++            {consent ? <p className="mt-2 text-sm font-semibold text-emerald-700">Allowed ✓</p>
++              : <button className="btn-primary mt-3" onClick={enableConsent}><ShieldCheck className="h-4 w-4" /> Allow and continue</button>}
++          </Bubble>
++        );
++      case "recordSetup": {
++        const live = rec.state !== "idle" && recMode.current === "visit" && recSetupId.current === m.id;
++        return (
++          <Bubble>
++            <p className="flex items-center gap-2 font-semibold text-ink"><Stethoscope className="h-5 w-5 text-teal" /> Record your doctor visit</p>
++            {!live ? (
++              <>
++                <input className="input mt-3" placeholder="Doctor's name (optional)" value={m.doctor} onChange={(e) => update(m.id, { doctor: e.target.value })} />
++                <label className="mt-3 flex items-start gap-2 rounded-xl bg-canvas p-3 text-sm text-ink">
++                  <input type="checkbox" className="mt-1 h-5 w-5" checked={m.agreed} onChange={(e) => update(m.id, { agreed: e.target.checked })} />
++                  <span><b>The doctor and everyone in the room agreed to this recording.</b> The audio is turned into text and is not stored. Nothing is saved until you check and confirm it.</span>
++                </label>
++                <div className="mt-3 flex gap-2">
++                  <button className="btn-danger rounded-full px-5" disabled={!m.agreed || rec.state !== "idle"} onClick={() => startVisitRecording(m.id)}>
++                    {rec.state === "starting" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Mic className="h-4 w-4" />} Start recording
++                  </button>
++                  <button className="btn-ghost" onClick={() => remove(m.id)}>Cancel</button>
++                </div>
++              </>
++            ) : (
++              <div className="mt-3">
++                <div className="flex items-center gap-3">
++                  <span className="relative flex h-3 w-3"><span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" /><span className="relative inline-flex h-3 w-3 rounded-full bg-red-600" /></span>
++                  <span className="font-mono text-lg font-semibold text-ink">{mmss(rec.seconds)}</span>
++                  <div className="flex h-10 flex-1 items-center gap-[3px]" aria-hidden="true">
++                    {rec.levels.map((l, i) => <span key={i} className="w-[3px] rounded-full bg-teal" style={{ height: `${Math.max(3, l * 40)}px` }} />)}
++                  </div>
++                </div>
++                <div className="mt-3 flex gap-2">
++                  <button className="btn-primary rounded-full px-5" onClick={finishVisitRecording}><Square className="h-4 w-4" /> Stop and continue</button>
++                  <button className="btn-ghost" onClick={() => { rec.cancel(); recMode.current = null; }}>Cancel</button>
++                </div>
++              </div>
++            )}
++          </Bubble>
++        );
++      }
++      case "review": {
++        const v = visits[m.visitId];
++        if (!v) return null;
++        if (v.status === "confirmed") return <InstructionsCard visit={v} lang={lang} clips={clips} onChange={putVisit} toast={toast} />;
++        return <ReviewCard visit={v} toast={toast} onChange={putVisit} onDiscard={() => discard(v.id, m.id)}
++          onConfirmed={(cv) => {
++            visitsChanged();
++            push({ role: "assistant", kind: "note", text: lang === "ta" ? "சேமிக்கப்பட்டது. கீழே உங்கள் மொழியில் கேளுங்கள்." : "Saved. You can now hear it in your language and ask questions about it.", tone: "ok" });
++            if (consent) api.post(`/api/visits/${cv.id}/prewarm`, { langs: ["en"] }).catch(() => {});
++          }} />;
++      }
++      case "visit": {
++        const v = visits[m.visitId];
++        return v ? <InstructionsCard visit={v} lang={lang} clips={clips} onChange={putVisit} toast={toast} /> : null;
++      }
++      case "answer":
++        return <AnswerCard a={m.a} clips={clips} />;
++      case "note":
++        return <p className={`px-1 text-sm ${m.tone === "ok" ? "font-medium text-emerald-700" : "text-muted"}`}>{m.text}</p>;
++      default:
++        return null;
++    }
++  };
++
++  return (
++    <div className="relative flex h-[calc(100dvh-65px)] flex-col"
++      onDragOver={(e) => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)}
++      onDrop={(e) => { e.preventDefault(); setDrag(false); uploadFile(e.dataTransfer.files?.[0]); }}>
++      {drag && (
++        <div className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-3xl border-2 border-dashed border-teal bg-teal-50/90 text-lg font-semibold text-teal-700">
++          Drop your prescription or report here
++        </div>
++      )}
++
++      {/* top bar: language */}
++      <div className="flex items-center justify-between gap-3 border-b border-line/70 bg-white px-4 py-2.5 sm:px-6">
++        <p className="text-sm font-semibold text-ink">Ask MediMemory</p>
++        <div className="flex rounded-full bg-canvas p-1 text-sm font-semibold" role="group" aria-label="Language">
++          {[["en", "English"], ["ta", "தமிழ்"]].map(([k, label]) => (
++            <button key={k} onClick={() => { setLang(k); clips.stop(); }} aria-pressed={lang === k}
++              className={`rounded-full px-4 py-1.5 transition ${lang === k ? "bg-teal text-white shadow" : "text-muted hover:text-ink"}`}>{label}</button>
++          ))}
++        </div>
++      </div>
++
++      {/* thread */}
++      <div className="flex-1 overflow-y-auto">
++        <div className="mx-auto max-w-3xl space-y-4 px-4 py-6 sm:px-6">
++          {thread.length === 0 && (
++            <div className="pt-1 text-center sm:pt-4">
++              <span className="mx-auto hidden h-14 w-14 items-center justify-center rounded-full bg-orb text-white shadow-glow sm:flex"><Sparkles className="h-6 w-6" /></span>
++              <h1 className="mt-2 text-2xl sm:mt-5 font-semibold text-ink sm:text-3xl">{lang === "ta" ? "வணக்கம்" : "Vanakkam"}, {firstName}</h1>
++              <p className="mx-auto mt-2 max-w-md text-sm text-muted sm:text-base">Never miss what your doctor told you. Record the visit or upload the prescription, check it once, then hear it in your language any time.</p>
++              <div className="mt-5 grid gap-2 text-left sm:mt-6 sm:grid-cols-3 sm:gap-3">
++                <button onClick={openRecordSetup} className="card grid grid-cols-[auto_1fr] items-center gap-x-3 p-3 text-left transition hover:border-teal hover:shadow-lg sm:flex sm:flex-col sm:items-start sm:gap-2 sm:p-4">
++                  <Mic className="row-span-2 h-6 w-6 text-red-500" /><span className="font-semibold text-ink">Record my doctor visit</span><span className="col-start-2 text-xs text-muted">With everyone's consent</span>
++                </button>
++                <button onClick={() => fileRef.current?.click()} className="card grid grid-cols-[auto_1fr] items-center gap-x-3 p-3 text-left transition hover:border-teal hover:shadow-lg sm:flex sm:flex-col sm:items-start sm:gap-2 sm:p-4">
++                  <Upload className="row-span-2 h-6 w-6 text-brand" /><span className="font-semibold text-ink">Upload a prescription</span><span className="col-start-2 text-xs text-muted">Photo or PDF</span>
++                </button>
++                <button onClick={() => (lastConfirmed ? inputRef.current?.focus() : runSample())} className="card grid grid-cols-[auto_1fr] items-center gap-x-3 p-3 text-left transition hover:border-teal hover:shadow-lg sm:flex sm:flex-col sm:items-start sm:gap-2 sm:p-4">
++                  <Sparkles className="row-span-2 h-6 w-6 text-teal" /><span className="font-semibold text-ink">{lastConfirmed ? "Ask a question" : "Try a sample visit"}</span>
++                  <span className="col-start-2 text-xs text-muted">{lastConfirmed ? "Type or tap the mic" : "Pre-written, for a quick look"}</span>
++                </button>
++              </div>
++              {!consent && (
++                <p className="mx-auto mt-5 max-w-lg rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-800">
++                  Voice and AI features are off. <button className="font-semibold underline" onClick={enableConsent}>Allow them</button> to record, read documents and hear answers.
++                </p>
++              )}
++              {lastConfirmed && (
++                <div className="mt-6 text-left">
++                  <p className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-muted">Your last visit</p>
++                  <InstructionsCard visit={lastConfirmed} lang={lang} clips={clips} onChange={putVisit} toast={toast} compact />
++                </div>
++              )}
++            </div>
++          )}
++          {thread.map((m) => <div key={m.id} className={m.role === "user" ? "flex" : ""}>{renderMsg(m)}</div>)}
++          <div ref={endRef} />
++        </div>
++      </div>
++
++      {/* composer */}
++      <div className="border-t border-line/70 bg-white/90 px-3 pb-3 pt-2 backdrop-blur sm:px-6">
++        <div className="mx-auto max-w-3xl">
++          {thread.length === 0 && lastConfirmed && (
++            <div className="-mx-1 mb-2 flex gap-2 overflow-x-auto px-1 pb-1">
++              {SUGGEST[lang].map((s) => <button key={s} className="shrink-0 whitespace-nowrap rounded-full border border-line bg-white px-3 py-1.5 text-xs font-medium text-navy hover:border-teal" onClick={() => ask(s)}>{s}</button>)}
++            </div>
++          )}
++          {recordingQuestion ? (
++            <div className="flex items-center gap-3 rounded-3xl border-2 border-teal bg-teal-50 px-4 py-3">
++              <span className="relative flex h-3 w-3"><span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" /><span className="relative inline-flex h-3 w-3 rounded-full bg-red-600" /></span>
++              <span className="text-sm font-semibold text-teal-700">{lang === "ta" ? "கேட்கிறேன்…" : "Listening…"} {mmss(rec.seconds)}</span>
++              <div className="flex h-8 flex-1 items-center gap-[3px]" aria-hidden="true">
++                {rec.levels.map((l, i) => <span key={i} className="w-[3px] rounded-full bg-teal" style={{ height: `${Math.max(3, l * 30)}px` }} />)}
++              </div>
++              <button className="rounded-full p-2 text-muted hover:bg-white" aria-label="Cancel" onClick={() => { rec.cancel(); recMode.current = null; }}><X className="h-5 w-5" /></button>
++              <button className="flex h-12 w-12 items-center justify-center rounded-full bg-teal text-white shadow-lg" aria-label="Stop and ask" onClick={finishQuestion}><Square className="h-5 w-5" /></button>
++            </div>
++          ) : (
++            <div className="relative flex items-end gap-2 rounded-3xl border border-line bg-white p-2 shadow-card focus-within:border-teal">
++              <div className="relative" ref={menuRef}>
++                <button className="flex h-11 w-11 items-center justify-center rounded-full text-navy hover:bg-canvas" aria-label="Add: record a visit or upload a document" aria-expanded={menu} onClick={() => setMenu(!menu)}>
++                  <Plus className={`h-6 w-6 transition ${menu ? "rotate-45" : ""}`} />
++                </button>
++                {menu && (
++                  <div className="absolute bottom-14 left-0 z-30 w-72 overflow-hidden rounded-2xl border border-line bg-white py-1 shadow-card">
++                    <button className="flex w-full items-center gap-3 px-4 py-3 text-left text-sm hover:bg-canvas" onClick={openRecordSetup}><Mic className="h-5 w-5 text-red-500" /><span><b>Record doctor visit</b><br /><span className="text-xs text-muted">With consent; turned into text</span></span></button>
++                    <button className="flex w-full items-center gap-3 px-4 py-3 text-left text-sm hover:bg-canvas" onClick={() => fileRef.current?.click()}><Paperclip className="h-5 w-5 text-brand" /><span><b>Upload prescription or report</b><br /><span className="text-xs text-muted">Photo, PDF or text file</span></span></button>
++                    <button className="flex w-full items-center gap-3 px-4 py-3 text-left text-sm hover:bg-canvas" onClick={runSample}><FileText className="h-5 w-5 text-muted" /><span><b>Use a sample visit</b><br /><span className="text-xs text-muted">Pre-written, clearly labelled</span></span></button>
++                  </div>
++                )}
++              </div>
++              <textarea ref={inputRef} rows={1} value={input} disabled={busy}
++                onChange={(e) => setInput(e.target.value)}
++                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(input); } }}
++                placeholder={lang === "ta" ? "கேள்வி கேளுங்கள்…" : "Ask a question…"}
++                className="max-h-40 min-h-[44px] flex-1 resize-none bg-transparent px-1 py-2.5 text-[16px] text-ink placeholder:text-muted/70 focus:outline-none" aria-label="Your question" />
++              {input.trim() ? (
++                <button className="flex h-11 w-11 items-center justify-center rounded-full bg-navy text-white disabled:opacity-50" disabled={busy} aria-label="Send" onClick={() => ask(input)}>
++                  {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <ArrowUp className="h-5 w-5" />}
++                </button>
++              ) : (
++                <button className="flex h-12 w-12 items-center justify-center rounded-full bg-teal text-white shadow-lg shadow-teal/30 disabled:opacity-50" disabled={busy || rec.state !== "idle"}
++                  aria-label="Ask by voice" onClick={startQuestion}>
++                  {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Mic className="h-6 w-6" />}
++                </button>
++              )}
++            </div>
++          )}
++          <input ref={fileRef} type="file" className="hidden" accept=".pdf,.png,.jpg,.jpeg,.webp,.txt" onChange={(e) => uploadFile(e.target.files?.[0])} />
++          <p className="mt-2 text-center text-[11px] text-muted">
++            MediMemory repeats what your doctor told you. It does not diagnose or change medicines. In an emergency call <a href="tel:108" className="font-semibold text-red-600">108</a>.
++          </p>
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/frontend/src/test/chat.test.jsx b/frontend/src/test/chat.test.jsx
+new file mode 100644
+index 0000000..01a1ef6
+--- /dev/null
++++ b/frontend/src/test/chat.test.jsx
+@@ -0,0 +1,74 @@
++import { render, screen } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import { MemoryRouter, Route, Routes } from "react-router-dom";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("../services/api", async (orig) => {
++  const actual = await orig();
++  return { ...actual, api: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), put: vi.fn(), delete: vi.fn(), interceptors: actual.api.interceptors } };
++});
++
++import { api } from "../services/api";
++import { AuthProvider, useAuth } from "../context/AuthContext";
++import { ToastProvider } from "../context/ToastContext";
++import ChatHome from "../pages/ChatHome";
++
++const USER = { id: 7, email: "demo@medimemory.app", full_name: "Lakshmi Raman", profile: { ai_data_consent: false, preferred_language: "ta" } };
++const VISIT = {
++  id: 3, doctor_name: "Dr. Kavitha Rao", visit_date: "2026-11-20", status: "confirmed", source: "recording", instructions: [
++    { id: 11, category: "medicine", simple_text: "Take Metformin 500 mg after breakfast.", source_sentence: "Take Metformin 500 mg after breakfast.",
++      translations: { ta: { text: "காலை உணவுக்குப் பிறகு Metformin 500 mg.", verified: false, method: "machine" } } },
++  ],
++};
++
++function Gate() { const { user } = useAuth(); return user ? <ChatHome /> : null; }
++
++function mount() {
++  sessionStorage.setItem("medimemory_token", "tok");
++  api.get.mockImplementation((url) => Promise.resolve({ data: url === "/api/auth/me" ? USER : url === "/api/visits" ? [VISIT] : [] }));
++  return render(<MemoryRouter initialEntries={["/app"]}><ToastProvider><AuthProvider><Routes>
++    <Route path="/app" element={<Gate />} /></Routes></AuthProvider></ToastProvider></MemoryRouter>);
++}
++
++beforeEach(() => { vi.clearAllMocks(); sessionStorage.clear(); localStorage.clear(); window.HTMLElement.prototype.scrollIntoView = vi.fn(); });
++
++describe("chat home", () => {
++  it("puts record, upload and ask on one page, defaults to Tamil and flags unverified translation", async () => {
++    mount();
++    expect(await screen.findByText("Record my doctor visit")).toBeInTheDocument();
++    expect(screen.getByText("Upload a prescription")).toBeInTheDocument();
++    expect(screen.getByLabelText("Ask by voice")).toBeInTheDocument();
++    expect(screen.getByRole("button", { name: "தமிழ்" })).toHaveAttribute("aria-pressed", "true");
++    expect(await screen.findByText(/Metformin 500 mg\./)).toBeInTheDocument();
++    expect(screen.getByText(/not yet checked by a Tamil speaker/)).toBeInTheDocument();
++  });
++
++  it("asks for AI consent before recording", async () => {
++    mount();
++    await userEvent.click(await screen.findByText("Record my doctor visit"));
++    expect(screen.getByText("One permission first")).toBeInTheDocument();
++  });
++
++  it("shows the emergency card with a call button", async () => {
++    mount();
++    await screen.findByText("Record my doctor visit");
++    api.post.mockResolvedValueOnce({ data: { type: "emergency", reason: "emergency", lang: "en", matches: [], phrase: "emergency",
++      message: "This could be an emergency. Please call 108 or go to the nearest hospital now." } });
++    await userEvent.click(screen.getByRole("button", { name: "English" }));
++    await userEvent.type(screen.getByLabelText("Your question"), "I have chest pain{enter}");
++    expect(await screen.findByText(/call 108/)).toBeInTheDocument();
++    expect(screen.getByRole("link", { name: /Call 108/ })).toHaveAttribute("href", "tel:108");
++    expect(api.post).toHaveBeenCalledWith("/api/visits/ask", { question: "I have chest pain", lang: "en" });
++  });
++
++  it("shows grounded answers with the doctor's source sentence", async () => {
++    mount();
++    await screen.findByText("Record my doctor visit");
++    api.post.mockResolvedValueOnce({ data: { type: "grounded", lang: "en", timing_ms: 40, matches: [{
++      instruction_id: 11, visit_id: 3, doctor_name: "Dr. Kavitha Rao", visit_date: "2026-11-20", text: "Take Metformin 500 mg after breakfast.",
++      text_lang: "en", translation_verified: true, english: "Take Metformin 500 mg after breakfast.", source_sentence: "Metformin 500 after breakfast, amma." }] } });
++    await userEvent.type(screen.getByLabelText("Your question"), "When do I take Metformin?{enter}");
++    expect(await screen.findByText(/Metformin 500 after breakfast, amma/)).toBeInTheDocument();
++    expect(screen.getByText(/Answered only from instructions you confirmed/)).toBeInTheDocument();
++  });
++});
+diff --git a/frontend/src/test/flows.test.jsx b/frontend/src/test/flows.test.jsx
+index 8a27580..bb9b01e 100644
+--- a/frontend/src/test/flows.test.jsx
++++ b/frontend/src/test/flows.test.jsx
+@@ -54,7 +54,7 @@ describe("navigation and mobile menu", () => {
+     render(<MemoryRouter initialEntries={["/app"]}><ToastProvider><AuthProvider><Routes>
+       <Route path="/app" element={<AppLayout />}><Route index element={<div>OVERVIEW PAGE</div>} /></Route></Routes></AuthProvider></ToastProvider></MemoryRouter>);
+     await screen.findByText("OVERVIEW PAGE");
+-    for (const label of ["Overview", "Medical Records", "Consultations", "AI Assistant", "Voice Assistant", "Medications", "Appointments", "Family Access", "Settings"]) {
++    for (const label of ["Chat", "Medicines & reminders", "Documents", "Family access", "Overview", "Settings"]) {
+       expect(screen.getAllByText(label).length).toBeGreaterThan(0);
+     }
+     expect(screen.queryByRole("dialog", { name: "Navigation menu" })).toBeNull();
+-- 
+2.43.0
+

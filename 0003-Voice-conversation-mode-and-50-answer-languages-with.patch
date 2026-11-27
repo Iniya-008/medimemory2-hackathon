@@ -1,0 +1,1147 @@
+From 0d5f3f1d43fc2cf6618956f44803c359675fbff5 Mon Sep 17 00:00:00 2001
+From: MediMemory team <team@medimemory.local>
+Date: Wed, 25 Nov 2026 18:05:09 +0000
+Subject: [PATCH 3/3] Voice conversation mode and 50+ answer languages with
+ per-language ElevenLabs voice model
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01URxMv78p3mykqFwFA9FPJW
+---
+ backend/app/api/visits.py                  | 128 ++++++++---
+ backend/app/api/voice.py                   |   2 +
+ backend/app/core/languages.py              |  78 +++++++
+ backend/app/models/__init__.py             |   2 +-
+ backend/app/models/visits.py               |  12 ++
+ backend/app/services/visit_ai.py           |  24 ++-
+ backend/tests/test_visits_flow.py          |  79 +++++++
+ docs/FINALS_STAGING.md                     |   7 +
+ frontend/src/components/LanguagePicker.jsx |  26 +++
+ frontend/src/components/VisitCards.jsx     |  29 +--
+ frontend/src/components/VoiceMode.jsx      | 235 +++++++++++++++++++++
+ frontend/src/hooks/useLanguages.js         |  31 +++
+ frontend/src/pages/ChatHome.jsx            |  44 ++--
+ frontend/src/test/chat.test.jsx            |  27 ++-
+ 14 files changed, 652 insertions(+), 72 deletions(-)
+ create mode 100644 backend/app/core/languages.py
+ create mode 100644 frontend/src/components/LanguagePicker.jsx
+ create mode 100644 frontend/src/components/VoiceMode.jsx
+ create mode 100644 frontend/src/hooks/useLanguages.js
+
+diff --git a/backend/app/api/visits.py b/backend/app/api/visits.py
+index 9dea10a..b0e9c96 100644
+--- a/backend/app/api/visits.py
++++ b/backend/app/api/visits.py
+@@ -24,26 +24,33 @@ from datetime import date
+ 
+ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+ from fastapi.responses import Response
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, Field, field_validator
+ from sqlalchemy import select
+ from sqlalchemy.orm import Session, selectinload
+ 
++from app.core import languages as L
+ from app.core.config import settings
+ from app.core.deps import client_ip, get_current_user
+ from app.core.llm import LLMUnavailable
+ from app.core.ratelimit import limit
+ from app.database.session import get_db
+ from app.models import Consultation, DoctorInstruction, MedicalDocument, User, utcnow
+-from app.models.visits import CATEGORIES, AudioClip, InstructionTranslation, Visit, VisitInstruction
++from app.models.visits import CATEGORIES, AudioClip, InstructionTranslation, PhraseTranslation, Visit, VisitInstruction
+ from app.rag.indexer import index_source
+-from app.safety import TAMIL_TEXT_VERIFIED, classify, message
++from app.safety import MESSAGES, TAMIL_TEXT_VERIFIED, classify
+ from app.services import extraction as docx
+ from app.services import storage, visit_ai
+ from app.services.audit import audit
+ from app.voice import elevenlabs as el
+ 
+ router = APIRouter(prefix="/api/visits", tags=["visits"])
+-LANGS = ("en", "ta")
++PHRASES = ("emergency", "dose_change", "new_medicine", "diagnosis", "not_found")
++
++
++def _lang_ok(v: str) -> str:
++    if not L.supported(v):
++        raise ValueError("Unsupported language.")
++    return v
+ MAX_AUDIO = 25 * 1024 * 1024
+ AUDIO_TYPES = ("audio/", "video/webm", "video/mp4", "application/octet-stream")
+ 
+@@ -70,7 +77,8 @@ class InstructionsIn(BaseModel):
+ 
+ 
+ class TranslateIn(BaseModel):
+-    lang: str = Field(pattern="^(en|ta)$")
++    lang: str = Field(max_length=10)
++    _v = field_validator("lang")(_lang_ok)
+ 
+ 
+ class TranslationEditIn(BaseModel):
+@@ -81,7 +89,8 @@ class TranslationEditIn(BaseModel):
+ 
+ class AskIn(BaseModel):
+     question: str = Field(min_length=2, max_length=500)
+-    lang: str = Field(default="en", pattern="^(en|ta)$")
++    lang: str = Field(default="en", max_length=10)
++    _v = field_validator("lang")(_lang_ok)
+ 
+ 
+ class PrewarmIn(BaseModel):
+@@ -152,7 +161,7 @@ def _clip_key(model: str, voice: str, lang: str, text: str) -> str:
+ 
+ def get_audio(db: Session, text: str, lang: str, voice: str) -> tuple[bytes, bool]:
+     """Returns (mp3 bytes, cache_hit)."""
+-    model = settings.elevenlabs_tts_model
++    model = settings.elevenlabs_tts_model if L.tts_model(lang) == L.V2 else L.V3
+     key = _clip_key(model, voice, lang, text)
+     clip = db.get(AudioClip, key)
+     if clip:
+@@ -175,6 +184,32 @@ def _mp3(data: bytes, hit: bool, verified: bool) -> Response:
+         "Access-Control-Expose-Headers": "X-Audio-Cache, X-Translation-Verified"})
+ 
+ 
++def get_phrase(db: Session, kind: str, lang: str) -> tuple[str, str, bool]:
++    """(text, text_lang, verified) for a fixed safety message. Falls back to English if it can't be translated."""
++    if lang == "en":
++        return MESSAGES[kind]["en"], "en", True
++    if lang in MESSAGES[kind]:
++        return MESSAGES[kind][lang], lang, TAMIL_TEXT_VERIFIED if lang == "ta" else False
++    row = db.scalar(select(PhraseTranslation).where(PhraseTranslation.kind == kind, PhraseTranslation.lang == lang))
++    if row:
++        return row.text, lang, row.verified
++    try:
++        out = visit_ai.translate([(1, MESSAGES[kind]["en"])], lang)
++    except LLMUnavailable:
++        out = {}
++    if not out.get(1):
++        return MESSAGES[kind]["en"], "en", True
++    db.add(PhraseTranslation(kind=kind, lang=lang, text=out[1]))
++    db.commit()
++    return out[1], lang, False
++
++
++@router.get("/languages")
++def list_languages(user: User = Depends(get_current_user)):
++    return {"languages": L.catalogue(), "default": (user.profile.preferred_language if user.profile else None) or "en",
++            "llm_configured": settings.llm_enabled}
++
++
+ # ------------------------------------------------------------------ capture
+ @router.post("/record", status_code=201)
+ async def record(request: Request, file: UploadFile = File(...), consent: bool = Form(...),
+@@ -392,7 +427,7 @@ def translate(vid: int, body: TranslateIn, request: Request, user: User = Depend
+ @router.put("/instructions/{iid}/translations/{lang}")
+ def edit_translation(iid: int, lang: str, body: TranslationEditIn, request: Request,
+                      user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+-    if lang not in LANGS or lang == "en":
++    if not L.supported(lang) or lang == "en":
+         raise HTTPException(400, "Unsupported language.")
+     ins = db.scalar(select(VisitInstruction).options(selectinload(VisitInstruction.translations))
+                     .where(VisitInstruction.id == iid, VisitInstruction.owner_id == user.id))
+@@ -414,7 +449,7 @@ def edit_translation(iid: int, lang: str, body: TranslationEditIn, request: Requ
+ 
+ @router.get("/instructions/{iid}/audio")
+ def instruction_audio(iid: int, lang: str = "en", user: User = Depends(limit("visit_audio", 120)), db: Session = Depends(get_db)):
+-    if lang not in LANGS:
++    if not L.supported(lang):
+         raise HTTPException(400, "Unsupported language.")
+     ins = db.scalar(select(VisitInstruction).options(selectinload(VisitInstruction.translations), selectinload(VisitInstruction.visit))
+                     .where(VisitInstruction.id == iid, VisitInstruction.owner_id == user.id))
+@@ -432,11 +467,12 @@ def instruction_audio(iid: int, lang: str = "en", user: User = Depends(limit("vi
+ 
+ @router.get("/phrases/{kind}/audio")
+ def phrase_audio(kind: str, lang: str = "en", user: User = Depends(limit("visit_audio", 120)), db: Session = Depends(get_db)):
+-    if lang not in LANGS or kind not in ("emergency", "dose_change", "new_medicine", "diagnosis", "not_found"):
++    if not L.supported(lang) or kind not in PHRASES:
+         raise HTTPException(400, "Unknown phrase.")
+     _ai_consent(user)
+-    data, hit = get_audio(db, message(kind, lang), lang, _voice_for(lang, user))
+-    return _mp3(data, hit, lang == "en" or TAMIL_TEXT_VERIFIED)
++    text, tlang, verified = get_phrase(db, kind, lang)
++    data, hit = get_audio(db, text, tlang, _voice_for(tlang, user))
++    return _mp3(data, hit, verified)
+ 
+ 
+ @router.post("/{vid}/prewarm")
+@@ -446,14 +482,14 @@ def prewarm(vid: int, body: PrewarmIn, user: User = Depends(limit("visit_prewarm
+         raise HTTPException(409, "Confirm the visit first.")
+     _ai_consent(user)
+     made = cached = missing = 0
+-    for lang in dict.fromkeys(x for x in body.langs if x in LANGS):
+-        texts = [_text(i, lang)[0] for i in v.instructions]
+-        texts += [message(k, lang) for k in ("emergency", "dose_change", "new_medicine", "diagnosis", "not_found")]
+-        for t in texts:
++    for lang in dict.fromkeys(x for x in body.langs if L.supported(x)):
++        texts = [(_text(i, lang)[0], lang) for i in v.instructions]
++        texts += [get_phrase(db, k, lang)[:2] for k in PHRASES]
++        for t, tl in texts:
+             if not t:
+                 missing += 1
+                 continue
+-            _, hit = get_audio(db, t, lang, _voice_for(lang, user))
++            _, hit = get_audio(db, t, tl, _voice_for(tl, user))
+             cached += hit
+             made += not hit
+     return {"generated": made, "already_cached": cached, "missing_translation": missing}
+@@ -463,40 +499,62 @@ def prewarm(vid: int, body: PrewarmIn, user: User = Depends(limit("visit_prewarm
+ @router.post("/ask")
+ def ask(body: AskIn, request: Request, user: User = Depends(limit("visit_ask", 30)), db: Session = Depends(get_db)):
+     t0 = time.perf_counter()
++    lang = body.lang
++    ai_ok = settings.llm_enabled and bool(user.profile and user.profile.ai_data_consent)
++    # Safety rules read English (and Tamil) patterns. For other scripts, also check an English rendering.
++    english = visit_ai.to_english(body.question) if ai_ok and visit_ai.needs_english(body.question) else None
+     verdict = classify(body.question)
+-    base = {"question": body.question, "lang": body.lang, "matches": [], "matcher": None}
++    if not verdict.blocked and english:
++        verdict = classify(english)
++    base = {"question": body.question, "question_english": english, "lang": lang, "matches": [], "matcher": None,
++            "safety_checked_in": "original+english" if english else ("original" if not visit_ai.needs_english(body.question) or body.question.isascii() else "original-only (no AI to translate)")}
++
++    def fixed(kind: str, atype: str, reason: str) -> dict:
++        text, tlang, verified = get_phrase(db, kind, lang)
++        return {**base, "type": atype, "reason": reason, "message": text, "message_lang": tlang, "phrase": kind,
++                "message_verified": verified, "timing_ms": round((time.perf_counter() - t0) * 1000)}
++
+     if verdict.blocked:
+-        kind = verdict.kind
+-        audit(db, user.id, f"ask.{kind}", detail=body.question[:200], ip=client_ip(request))
++        audit(db, user.id, f"ask.{verdict.kind}", detail=body.question[:200], ip=client_ip(request))
+         db.commit()
+-        return {**base, "type": "emergency" if kind == "emergency" else "refusal", "reason": kind,
+-                "message": message(kind, body.lang), "phrase": kind,
+-                "message_verified": body.lang == "en" or TAMIL_TEXT_VERIFIED,
+-                "timing_ms": round((time.perf_counter() - t0) * 1000)}
++        out = fixed(verdict.kind, "emergency" if verdict.kind == "emergency" else "refusal", verdict.kind)
++        if verdict.kind == "emergency" and out["message_lang"] != "en":
++            out["message_english"] = MESSAGES["emergency"]["en"]  # the 108 instruction is always also shown in English
++        return out
+ 
+     ins_list = db.scalars(select(VisitInstruction).join(Visit)
+                           .options(selectinload(VisitInstruction.translations), selectinload(VisitInstruction.visit))
+                           .where(VisitInstruction.owner_id == user.id, Visit.status == "confirmed")).all()
+     candidates = [{"id": i.id, "category": i.category,
+                    "texts": [i.simple_text, i.source_sentence] + [t.text for t in i.translations]} for i in ins_list]
+-    if settings.llm_enabled and not (user.profile and user.profile.ai_data_consent):
+-        matcher, ids = "keywords", visit_ai.keyword_match(body.question, candidates)
++    query = f"{body.question}\n(English: {english})" if english else body.question
++    if ai_ok:
++        matcher, ids = visit_ai.match(query, candidates)
+     else:
+-        matcher, ids = visit_ai.match(body.question, candidates)
++        matcher, ids = "keywords", visit_ai.keyword_match(english or body.question, candidates)
+     by_id = {i.id: i for i in ins_list}
++    if not ids:
++        return {**fixed("not_found", "not_found", "not_in_instructions"), "matcher": matcher}
++
++    # Translate any matched instruction that has no text in this language yet (stored, marked unverified).
++    if lang != "en" and ai_ok:
++        todo = [(i, by_id[i].simple_text) for i in ids if not _tr(by_id[i], lang)]
++        if todo:
++            try:
++                for iid, txt in visit_ai.translate(todo, lang).items():
++                    by_id[iid].translations.append(InstructionTranslation(lang=lang, text=txt))
++                db.commit()
++            except LLMUnavailable:
++                pass
+     matches = []
+     for iid in ids:
+         i = by_id[iid]
+-        text, verified = _text(i, body.lang)
++        text, verified = _text(i, lang)
+         matches.append({
+             "instruction_id": i.id, "visit_id": i.visit_id, "doctor_name": i.visit.doctor_name,
+             "visit_date": i.visit.visit_date.isoformat(), "category": i.category,
+-            "text": text or i.simple_text, "text_lang": body.lang if text else "en",
++            "text": text or i.simple_text, "text_lang": lang if text else "en",
+             "translation_verified": verified if text else False,
+             "english": i.simple_text, "source_sentence": i.source_sentence})
+-    elapsed = round((time.perf_counter() - t0) * 1000)
+-    if not matches:
+-        return {**base, "type": "not_found", "reason": "not_in_instructions", "message": message("not_found", body.lang),
+-                "phrase": "not_found", "message_verified": body.lang == "en" or TAMIL_TEXT_VERIFIED,
+-                "matcher": matcher, "timing_ms": elapsed}
+-    return {**base, "type": "grounded", "message": None, "matcher": matcher, "matches": matches, "timing_ms": elapsed}
++    return {**base, "type": "grounded", "message": None, "matcher": matcher, "matches": matches,
++            "timing_ms": round((time.perf_counter() - t0) * 1000)}
+diff --git a/backend/app/api/voice.py b/backend/app/api/voice.py
+index 472f88b..024356e 100644
+--- a/backend/app/api/voice.py
++++ b/backend/app/api/voice.py
+@@ -64,6 +64,8 @@ async def transcribe(request: Request, file: UploadFile = File(...), language_co
+     db.commit()
+     if not result["text"]:
+         raise HTTPException(422, "I couldn't hear any words in that recording. Please try again a little closer to the microphone.")
++    from app.core.languages import normalize
++    result["lang"] = normalize(result.get("language_code"))
+     return result
+ 
+ 
+diff --git a/backend/app/core/languages.py b/backend/app/core/languages.py
+new file mode 100644
+index 0000000..fd022d6
+--- /dev/null
++++ b/backend/app/core/languages.py
+@@ -0,0 +1,78 @@
++"""Languages MediMemory can speak, and which ElevenLabs voice model to use for each.
++
++Source: ElevenLabs "What languages do you support?" help page (checked Nov 2026).
++* Multilingual v2 is used where it supports the language (higher stability for long instructions).
++* Eleven v3 (70+ languages) is used for everything else, which covers most Indian languages.
++Speech-to-text (Scribe) understands 90+ languages, so questions can be asked in any of these.
++Every translation is machine-made and marked "not checked" until a native speaker verifies it.
++"""
++from __future__ import annotations
++
++V2 = "eleven_multilingual_v2"
++V3 = "eleven_v3"
++
++# code: (English name, native name, group)
++_LANGS: dict[str, tuple[str, str, str]] = {
++    # India first (order shown in the picker)
++    "en": ("English", "English", "india"), "ta": ("Tamil", "தமிழ்", "india"), "hi": ("Hindi", "हिन्दी", "india"),
++    "te": ("Telugu", "తెలుగు", "india"), "kn": ("Kannada", "ಕನ್ನಡ", "india"), "ml": ("Malayalam", "മലയാളം", "india"),
++    "bn": ("Bengali", "বাংলা", "india"), "mr": ("Marathi", "मराठी", "india"), "gu": ("Gujarati", "ગુજરાતી", "india"),
++    "pa": ("Punjabi", "ਪੰਜਾਬੀ", "india"), "ur": ("Urdu", "اردو", "india"), "or": ("Odia", "ଓଡ଼ିଆ", "india"),
++    "as": ("Assamese", "অসমীয়া", "india"), "ne": ("Nepali", "नेपाली", "india"), "sd": ("Sindhi", "سنڌي", "india"),
++    # rest of the world
++    "ar": ("Arabic", "العربية", "world"), "zh": ("Chinese (Mandarin)", "中文", "world"), "es": ("Spanish", "Español", "world"),
++    "fr": ("French", "Français", "world"), "de": ("German", "Deutsch", "world"), "pt": ("Portuguese", "Português", "world"),
++    "ru": ("Russian", "Русский", "world"), "ja": ("Japanese", "日本語", "world"), "ko": ("Korean", "한국어", "world"),
++    "id": ("Indonesian", "Bahasa Indonesia", "world"), "ms": ("Malay", "Bahasa Melayu", "world"), "vi": ("Vietnamese", "Tiếng Việt", "world"),
++    "th": ("Thai", "ไทย", "world"), "tr": ("Turkish", "Türkçe", "world"), "it": ("Italian", "Italiano", "world"),
++    "nl": ("Dutch", "Nederlands", "world"), "pl": ("Polish", "Polski", "world"), "fil": ("Filipino", "Filipino", "world"),
++    "sw": ("Swahili", "Kiswahili", "world"), "fa": ("Persian", "فارسی", "world"), "he": ("Hebrew", "עברית", "world"),
++    "uk": ("Ukrainian", "Українська", "world"), "ro": ("Romanian", "Română", "world"), "el": ("Greek", "Ελληνικά", "world"),
++    "cs": ("Czech", "Čeština", "world"), "hu": ("Hungarian", "Magyar", "world"), "sv": ("Swedish", "Svenska", "world"),
++    "da": ("Danish", "Dansk", "world"), "fi": ("Finnish", "Suomi", "world"), "no": ("Norwegian", "Norsk", "world"),
++    "bg": ("Bulgarian", "Български", "world"), "hr": ("Croatian", "Hrvatski", "world"), "sk": ("Slovak", "Slovenčina", "world"),
++    "sr": ("Serbian", "Српски", "world"), "my": ("Burmese", "မြန်မာ", "world"), "ps": ("Pashto", "پښتو", "world"),
++    "uz": ("Uzbek", "Oʻzbek", "world"), "kk": ("Kazakh", "Қазақ", "world"), "az": ("Azerbaijani", "Azərbaycan", "world"),
++    "ka": ("Georgian", "ქართული", "world"), "hy": ("Armenian", "Հայերեն", "world"), "yo": ("Yoruba", "Yorùbá", "world"),
++    "ha": ("Hausa", "Hausa", "world"), "so": ("Somali", "Soomaali", "world"),
++}
++_V2_LANGS = {"en", "ja", "zh", "de", "hi", "fr", "ko", "pt", "it", "es", "id", "nl", "tr", "fil", "pl", "sv", "bg", "ro",
++             "ar", "cs", "el", "fi", "hr", "ms", "sk", "da", "ta", "uk", "ru"}
++
++# Scribe may report ISO 639-3 codes; map the ones we support back to our codes.
++_ISO3 = {
++    "eng": "en", "tam": "ta", "hin": "hi", "tel": "te", "kan": "kn", "mal": "ml", "ben": "bn", "mar": "mr", "guj": "gu",
++    "pan": "pa", "urd": "ur", "ori": "or", "ory": "or", "asm": "as", "nep": "ne", "snd": "sd", "ara": "ar", "cmn": "zh",
++    "zho": "zh", "spa": "es", "fra": "fr", "deu": "de", "por": "pt", "rus": "ru", "jpn": "ja", "kor": "ko", "ind": "id",
++    "msa": "ms", "zsm": "ms", "vie": "vi", "tha": "th", "tur": "tr", "ita": "it", "nld": "nl", "pol": "pl", "fil": "fil",
++    "tgl": "fil", "swa": "sw", "fas": "fa", "pes": "fa", "heb": "he", "ukr": "uk", "ron": "ro", "ell": "el", "ces": "cs",
++    "hun": "hu", "swe": "sv", "dan": "da", "fin": "fi", "nor": "no", "nob": "no", "bul": "bg", "hrv": "hr", "slk": "sk",
++    "srp": "sr", "mya": "my", "pus": "ps", "uzb": "uz", "kaz": "kk", "aze": "az", "kat": "ka", "hye": "hy", "yor": "yo",
++    "hau": "ha", "som": "so",
++}
++
++
++def supported(code: str | None) -> bool:
++    return bool(code) and code in _LANGS
++
++
++def normalize(code: str | None) -> str | None:
++    """Map whatever the speech-to-text service returns ('tam', 'ta', 'ta-IN') to one of our codes, or None."""
++    if not code:
++        return None
++    c = code.strip().lower().replace("_", "-").split("-")[0]
++    if c in _LANGS:
++        return c
++    return _ISO3.get(c)
++
++
++def name(code: str) -> str:
++    return _LANGS.get(code, (code,))[0]
++
++
++def tts_model(code: str) -> str:
++    return V2 if code in _V2_LANGS else V3
++
++
++def catalogue() -> list[dict]:
++    return [{"code": k, "name": v[0], "native": v[1], "group": v[2], "voice_model": tts_model(k)} for k, v in _LANGS.items()]
+diff --git a/backend/app/models/__init__.py b/backend/app/models/__init__.py
+index cdb2896..1460d91 100644
+--- a/backend/app/models/__init__.py
++++ b/backend/app/models/__init__.py
+@@ -3,4 +3,4 @@ from app.models.entities import (  # noqa: F401
+     ConversationMessage, ConversationSession, DoctorInstruction, DocumentChunk, DocumentExtraction,
+     Medication, MedicationSchedule, MedicalDocument, PatientProfile, Reminder, RevokedToken, User, utcnow,
+ )
+-from app.models.visits import AudioClip, InstructionTranslation, Visit, VisitInstruction  # noqa: F401,E402
++from app.models.visits import AudioClip, InstructionTranslation, PhraseTranslation, Visit, VisitInstruction  # noqa: F401,E402
+diff --git a/backend/app/models/visits.py b/backend/app/models/visits.py
+index 879dc1e..ac151a1 100644
+--- a/backend/app/models/visits.py
++++ b/backend/app/models/visits.py
+@@ -77,3 +77,15 @@ class AudioClip(Base):
+     voice_id: Mapped[str] = mapped_column(String(80), nullable=False)
+     data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
++
++
++class PhraseTranslation(Base):
++    """Machine translations of the fixed safety messages (emergency, refusals, not found), cached per language."""
++    __tablename__ = "mm_phrase_translations"
++    id: Mapped[int] = mapped_column(Integer, primary_key=True)
++    kind: Mapped[str] = mapped_column(String(30), nullable=False)
++    lang: Mapped[str] = mapped_column(String(10), nullable=False)
++    text: Mapped[str] = mapped_column(Text, nullable=False)
++    verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
++    __table_args__ = (UniqueConstraint("kind", "lang", name="uq_phrase_lang"),)
+diff --git a/backend/app/services/visit_ai.py b/backend/app/services/visit_ai.py
+index 8c61764..7d054ad 100644
+--- a/backend/app/services/visit_ai.py
++++ b/backend/app/services/visit_ai.py
+@@ -11,11 +11,10 @@ from __future__ import annotations
+ import difflib
+ import re
+ 
++from app.core import languages as L
+ from app.core.llm import LLMUnavailable, chat_json
+ from app.models.visits import CATEGORIES
+ 
+-LANG_NAMES = {"en": "English", "ta": "Tamil"}
+-
+ # ------------------------------------------------------------------ helpers
+ _SENT_SPLIT = re.compile(r"(?<=[.!?।])\s+|\n+")
+ 
+@@ -144,7 +143,7 @@ def translate(items: list[tuple[int, str]], lang: str) -> dict[int, str]:
+     if lang == "en":
+         return {i: t for i, t in items}
+     lines = "\n".join(f'{{"id": {i}, "text": {t!r}}}' for i, t in items)
+-    data = chat_json(TRANSLATE_SYSTEM.format(lang=LANG_NAMES.get(lang, lang)), f"INSTRUCTIONS:\n{lines}")
++    data = chat_json(TRANSLATE_SYSTEM.format(lang=L.name(lang)), f"INSTRUCTIONS:\n{lines}")
+     out = {}
+     for r in data.get("translations") or []:
+         try:
+@@ -157,6 +156,25 @@ def translate(items: list[tuple[int, str]], lang: str) -> dict[int, str]:
+     return out
+ 
+ 
++TO_ENGLISH_SYSTEM = """Translate the patient's question into plain English, word for word in meaning.
++Do not answer it, soften it or add anything. Keep medicine names and numbers unchanged.
++Return JSON: {"english": "..."}"""
++
++
++def needs_english(text: str) -> bool:
++    """True when the question is not plain English (non-Latin script or a lot of non-ASCII)."""
++    t = text or ""
++    return sum(ord(ch) > 127 for ch in t) > max(2, len(t) * 0.15)
++
++
++def to_english(text: str) -> str | None:
++    """English rendering of a question so the safety rules and matching can read it. None if no LLM."""
++    try:
++        return str(chat_json(TO_ENGLISH_SYSTEM, text, timeout=15).get("english") or "").strip() or None
++    except LLMUnavailable:
++        return None
++
++
+ # ------------------------------------------------------------------ question matching
+ MATCH_SYSTEM = """A patient asks a question about instructions their doctor gave them. The question may be in Tamil or English.
+ Pick the instruction ids that directly answer it, from the numbered list only. If none answer it, return an empty list.
+diff --git a/backend/tests/test_visits_flow.py b/backend/tests/test_visits_flow.py
+index c762a40..c17348c 100644
+--- a/backend/tests/test_visits_flow.py
++++ b/backend/tests/test_visits_flow.py
+@@ -228,6 +228,7 @@ def test_llm_matcher_cannot_return_foreign_ids(client, auth, other_auth, monkeyp
+     other = make_confirmed(client, other_auth)
+     make_confirmed(client, auth)
+     foreign = other["instructions"][0]["id"]
++    monkeypatch.setattr(visits_api.settings, "llm_api_key", "test-key")
+     monkeypatch.setattr(visit_ai, "chat_json", lambda *a, **k: {"ids": [foreign, 99999]})
+     a = client.post("/api/visits/ask", headers=auth, json={"question": "When do I take Metformin?"}).json()
+     assert a["type"] == "not_found" and a["matcher"] == "llm"
+@@ -273,3 +274,81 @@ def test_unreadable_image_without_llm_gives_clear_message(client, auth, no_llm):
+     Image.new("RGB", (40, 40), "white").save(buf, "PNG")
+     r = client.post("/api/visits/document", headers=auth, files={"file": ("blank.png", buf.getvalue(), "image/png")})
+     assert r.status_code == 422 and "couldn't read" in r.json()["detail"].lower()
++
++
++
++# ---------------------------------------------------------------- many languages
++def fake_llm(monkeypatch, english, ids_for=None, translated="అనువాదం"):
++    """Routes the stubbed LLM by its system prompt."""
++    def chat(system, user, **k):
++        if system.startswith("Translate the patient's question"):
++            return {"english": english}
++        if system.startswith("Translate each medical instruction"):
++            import re as _re
++            return {"translations": [{"id": int(i), "text": f"{translated} {i}"} for i in _re.findall(r'"id": (\d+)', user)]}
++        if system.startswith("A patient asks"):
++            return {"ids": ids_for or []}
++        raise LLMUnavailable("not stubbed")
++    monkeypatch.setattr(visits_api.settings, "llm_api_key", "test-key")
++    monkeypatch.setattr(visit_ai, "chat_json", chat)
++
++
++def test_language_catalogue(client, auth):
++    langs = {l["code"]: l for l in client.get("/api/visits/languages", headers=auth).json()["languages"]}
++    assert {"en", "ta", "hi", "te", "kn", "ml", "bn", "mr"} <= set(langs)
++    assert langs["ta"]["voice_model"] == "eleven_multilingual_v2" and langs["te"]["voice_model"] == "eleven_v3"
++    assert len(langs) >= 50
++
++
++def test_unsupported_language_rejected(client, auth):
++    assert client.post("/api/visits/ask", headers=auth, json={"question": "hello there", "lang": "xx"}).status_code == 422
++
++
++def test_hindi_emergency_detected_through_english(client, auth, monkeypatch, no_llm):
++    consent(client, auth)
++    make_confirmed(client, auth)
++    fake_llm(monkeypatch, english="I have severe chest pain")
++    a = client.post("/api/visits/ask", headers=auth, json={"question": "मेरे सीने में तेज़ दर्द है", "lang": "hi"}).json()
++    assert a["type"] == "emergency" and a["matches"] == []
++    assert a["message_english"].startswith("This could be an emergency") and a["question_english"] == "I have severe chest pain"
++
++
++def test_telugu_answer_translated_on_the_fly_and_unverified(client, auth, monkeypatch, no_llm):
++    consent(client, auth)
++    v = make_confirmed(client, auth)
++    met = next(i["id"] for i in v["instructions"] if "Metformin" in i["simple_text"])
++    fake_llm(monkeypatch, english="When should I take Metformin?", ids_for=[met])
++    a = client.post("/api/visits/ask", headers=auth, json={"question": "మెట్ఫార్మిన్ ఎప్పుడు వేసుకోవాలి?", "lang": "te"}).json()
++    assert a["type"] == "grounded" and a["matches"][0]["text_lang"] == "te"
++    assert a["matches"][0]["translation_verified"] is False and a["matches"][0]["text"].startswith("అనువాదం")
++    stored = client.get(f"/api/visits/{v['id']}", headers=auth).json()
++    assert "te" in next(i for i in stored["instructions"] if i["id"] == met)["translations"]
++
++
++def test_refusal_phrase_translated_and_cached(client, auth, monkeypatch, no_llm):
++    consent(client, auth)
++    make_confirmed(client, auth)
++    fake_llm(monkeypatch, english="Can I double the dose?", translated="ಕನ್ನಡ")
++    a1 = client.post("/api/visits/ask", headers=auth, json={"question": "Can I double the dose?", "lang": "kn"}).json()
++    assert a1["type"] == "refusal" and a1["message_lang"] == "kn" and a1["message_verified"] is False
++    monkeypatch.setattr(visit_ai, "chat_json", lambda *a, **k: (_ for _ in ()).throw(LLMUnavailable("down")))
++    a2 = client.post("/api/visits/ask", headers=auth, json={"question": "Can I double the dose?", "lang": "kn"}).json()
++    assert a2["message"] == a1["message"]  # served from cache
++
++
++def test_phrase_falls_back_to_english_without_ai(client, auth, no_llm):
++    make_confirmed(client, auth)
++    a = client.post("/api/visits/ask", headers=auth, json={"question": "Can I double the dose?", "lang": "hi"}).json()
++    assert a["type"] == "refusal" and a["message_lang"] == "en"
++
++
++def test_voice_model_per_language(client, auth, no_llm, fake_tts, monkeypatch):
++    consent(client, auth)
++    v = make_confirmed(client, auth)
++    iid = v["instructions"][0]["id"]
++    models = []
++    monkeypatch.setattr(visits_api.el, "synthesize", lambda t, vid=None, model_id=None: models.append(model_id) or b"ID3x")
++    client.put(f"/api/visits/instructions/{iid}/translations/te", headers=auth, json={"text": "తెలుగు"})
++    client.get(f"/api/visits/instructions/{iid}/audio?lang=te", headers=auth)
++    client.get(f"/api/visits/instructions/{iid}/audio?lang=en", headers=auth)
++    assert models == ["eleven_v3", "eleven_multilingual_v2"]
+diff --git a/docs/FINALS_STAGING.md b/docs/FINALS_STAGING.md
+index 16a9f67..fddf71c 100644
+--- a/docs/FINALS_STAGING.md
++++ b/docs/FINALS_STAGING.md
+@@ -19,3 +19,10 @@
+    Save `core_loop_results.json`: these are the real latency numbers for the pitch.
+ 
+ Never paste API keys into chat, code or GitHub. Keys live only in Render's Environment tab.
++
++## Languages and voice mode (added)
++- 50+ answer languages. Voice model per language: Multilingual v2 where ElevenLabs supports it (English, Tamil, Hindi and 26 more), Eleven v3 for the rest (Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi, Urdu, Odia, Assamese, Nepali ...).
++- Every translation is machine-made and shown as "not yet checked by a native speaker" until someone verifies it in the app.
++- Safety rules for languages other than English/Tamil need the LLM (it translates the question to English first). Without LLM_API_KEY, only English and Tamil questions are safety-checked; always configure the LLM on staging.
++- Eleven v3 uses more ElevenLabs credits than Flash/Multilingual. Use "Play all" once per language before the demo so clips are cached.
++- Voice conversation (round button): hands-free. Listens, detects when you stop talking (about 1.3 s of silence), answers in the language you spoke, then listens again. Test once on the venue laptop with its real microphone.
+diff --git a/frontend/src/components/LanguagePicker.jsx b/frontend/src/components/LanguagePicker.jsx
+new file mode 100644
+index 0000000..decfcf8
+--- /dev/null
++++ b/frontend/src/components/LanguagePicker.jsx
+@@ -0,0 +1,26 @@
++import { Languages } from "lucide-react";
++import { useLanguages } from "../hooks/useLanguages";
++
++export default function LanguagePicker({ value, onChange, className = "" }) {
++  const { langs } = useLanguages();
++  const india = langs.filter((l) => l.group === "india");
++  const world = langs.filter((l) => l.group !== "india");
++  return (
++    <label className={`relative flex items-center gap-2 rounded-full bg-canvas py-1 pl-3 pr-1 text-sm font-semibold text-ink ${className}`}>
++      <Languages className="h-4 w-4 text-teal" aria-hidden="true" />
++      <span className="sr-only">Answer language</span>
++      <select value={value} onChange={(e) => onChange(e.target.value)} aria-label="Answer language"
++        className="max-w-[11rem] cursor-pointer appearance-none rounded-full bg-white py-1.5 pl-3 pr-7 text-sm font-semibold shadow-sm focus:outline-none focus:ring-2 focus:ring-teal/30">
++        <optgroup label="Indian languages">
++          {india.map((l) => <option key={l.code} value={l.code}>{l.native}{l.native !== l.name ? ` · ${l.name}` : ""}</option>)}
++        </optgroup>
++        {world.length > 0 && (
++          <optgroup label="Other languages">
++            {world.map((l) => <option key={l.code} value={l.code}>{l.native}{l.native !== l.name ? ` · ${l.name}` : ""}</option>)}
++          </optgroup>
++        )}
++      </select>
++      <span className="pointer-events-none absolute right-3 text-xs text-muted">▾</span>
++    </label>
++  );
++}
+diff --git a/frontend/src/components/VisitCards.jsx b/frontend/src/components/VisitCards.jsx
+index f164e98..5134e7d 100644
+--- a/frontend/src/components/VisitCards.jsx
++++ b/frontend/src/components/VisitCards.jsx
+@@ -4,6 +4,7 @@ import {
+   ShieldAlert, Stethoscope, Trash2, Volume2, X,
+ } from "lucide-react";
+ import { api, errorMessage, fmtDate } from "../services/api";
++import { useLanguages, word } from "../hooks/useLanguages";
+ 
+ export const CATEGORY = {
+   medicine: { label: "Medicine", ta: "மருந்து", tone: "bg-brand-50 text-brand-700" },
+@@ -36,7 +37,7 @@ function TranslationBadge({ t }) {
+   if (!t) return null;
+   return t.verified
+     ? <span className="chip bg-emerald-50 text-emerald-700"><CheckCircle2 className="h-3 w-3" /> Checked by {t.verified_by}</span>
+-    : <span className="chip bg-amber-50 text-amber-700"><AlertTriangle className="h-3 w-3" /> Machine translation · not yet checked by a Tamil speaker</span>;
++    : <span className="chip bg-amber-50 text-amber-700"><AlertTriangle className="h-3 w-3" /> Machine translation · not yet checked by a native speaker</span>;
+ }
+ 
+ export function Steps({ steps, active, failed }) {
+@@ -178,7 +179,7 @@ function TranslationEditor({ ins, lang, onSaved, toast }) {
+     <div className="mt-2 space-y-2 rounded-xl bg-canvas p-3">
+       <textarea className="input text-[15px]" rows={2} value={text} onChange={(e) => setText(e.target.value)} />
+       <div className="flex flex-wrap items-center gap-2 text-xs">
+-        <label className="flex items-center gap-1.5"><input type="checkbox" checked={verified} onChange={(e) => setVerified(e.target.checked)} /> Checked by a native Tamil speaker</label>
++        <label className="flex items-center gap-1.5"><input type="checkbox" checked={verified} onChange={(e) => setVerified(e.target.checked)} /> Checked by a native speaker</label>
+         <input className="input w-44 py-1.5 text-xs" placeholder="Reviewer name" value={reviewer} onChange={(e) => setReviewer(e.target.value)} />
+         <button className="btn-primary px-3 py-1.5 text-xs" disabled={busy || !text.trim()} onClick={save}>Save</button>
+       </div>
+@@ -187,6 +188,8 @@ function TranslationEditor({ ins, lang, onSaved, toast }) {
+ }
+ 
+ export function InstructionsCard({ visit, lang, clips, onChange, toast, compact }) {
++  const { byCode } = useLanguages();
++  const native = byCode[lang]?.native || lang;
+   const [busy, setBusy] = useState(false);
+   const [open, setOpen] = useState({});
+   const [editing, setEditing] = useState(null);
+@@ -199,7 +202,8 @@ export function InstructionsCard({ visit, lang, clips, onChange, toast, compact
+     catch (e) { toast.error(errorMessage(e)); }
+     finally { setBusy(false); }
+   };
+-  useEffect(() => { if (missing && !tried.current) { tried.current = true; translate(); } }, [missing]); // eslint-disable-line
++  useEffect(() => { tried.current = false; }, [lang]);
++  useEffect(() => { if (missing && !tried.current) { tried.current = true; translate(); } }, [missing, lang]); // eslint-disable-line
+ 
+   const textOf = (i) => (lang === "en" ? i.simple_text : i.translations?.[lang]?.text);
+   const trs = visit.instructions.map((i) => i.translations?.[lang]).filter(Boolean);
+@@ -218,16 +222,16 @@ export function InstructionsCard({ visit, lang, clips, onChange, toast, compact
+         </div>
+         {playable.length > 0 && (
+           <button className="btn-primary rounded-full px-4" onClick={() => clips.play(playable.map((i) => audioPath(i.id, lang)))}>
+-            <Play className="h-4 w-4" /> {lang === "ta" ? "எல்லாம் கேளுங்கள்" : "Play all"}
++            <Play className="h-4 w-4" /> {word("playAll", lang)}
+           </button>
+         )}
+       </div>
+       {allUnverified && <p className="mt-3"><TranslationBadge t={{ verified: false }} /></p>}
+-      {allVerified && <p className="mt-3 chip bg-emerald-50 text-emerald-700"><CheckCircle2 className="h-3 w-3" /> Tamil checked by a native speaker</p>}
++      {allVerified && <p className="mt-3 chip bg-emerald-50 text-emerald-700"><CheckCircle2 className="h-3 w-3" /> {native} checked by a native speaker</p>}
+       {missing && (
+         <p className="mt-3 flex items-center gap-2 text-sm text-muted">
+-          {busy ? <><Loader2 className="h-4 w-4 animate-spin" /> Translating to தமிழ்…</> :
+-            <button className="btn-outline px-3 py-1.5 text-xs" onClick={translate}>Translate to தமிழ்</button>}
++          {busy ? <><Loader2 className="h-4 w-4 animate-spin" /> Translating to {native}…</> :
++            <button className="btn-outline px-3 py-1.5 text-xs" onClick={translate}>Translate to {native}</button>}
+         </p>
+       )}
+       <ul className="mt-3 divide-y divide-line">
+@@ -238,7 +242,7 @@ export function InstructionsCard({ visit, lang, clips, onChange, toast, compact
+               <div className="flex items-start gap-3">
+                 <span className={`chip mt-1 shrink-0 ${cat.tone}`}>{lang === "ta" ? cat.ta : cat.label}</span>
+                 <p className={`min-w-0 flex-1 text-[17px] leading-relaxed ${text ? "text-ink" : "text-muted"}`}>{text || i.simple_text}</p>
+-                {text && <PlayBtn path={audioPath(i.id, lang)} clips={clips} label={lang === "ta" ? "கேளுங்கள்" : "Hear it"} />}
++                {text && <PlayBtn path={audioPath(i.id, lang)} clips={clips} label={word("hear", lang)} />}
+               </div>
+               <div className="ml-0 mt-1.5 flex flex-wrap items-center gap-2 sm:ml-[84px]">
+                 {lang !== "en" && !allUnverified && !allVerified && <TranslationBadge t={i.translations?.[lang]} />}
+@@ -281,9 +285,10 @@ export function AnswerCard({ a, clips }) {
+           <ShieldAlert className="mt-0.5 h-7 w-7 shrink-0 text-red-600" />
+           <div className="flex-1">
+             <p className="text-lg font-semibold text-red-800">{a.message}</p>
++            {a.message_english && <p className="mt-1 text-sm font-medium text-red-700">{a.message_english}</p>}
+             <div className="mt-3 flex flex-wrap gap-2">
+               <a href="tel:108" className="btn-danger rounded-full px-5 text-base"><Phone className="h-5 w-5" /> Call 108</a>
+-              <PlayBtn path={phrasePath("emergency", lang)} clips={clips} big label={lang === "ta" ? "கேளுங்கள்" : "Hear it"} />
++              <PlayBtn path={phrasePath("emergency", lang)} clips={clips} big label={word("hear", lang)} />
+             </div>
+             <p className="mt-2 text-xs text-red-700/80">For emergencies MediMemory does not look at your records.</p>
+           </div>
+@@ -299,8 +304,8 @@ export function AnswerCard({ a, clips }) {
+           <div className="flex-1">
+             <p className="text-[16px] text-ink">{a.message}</p>
+             <div className="mt-2 flex flex-wrap items-center gap-2">
+-              <PlayBtn path={phrasePath(a.phrase, lang)} clips={clips} label={lang === "ta" ? "கேளுங்கள்" : "Hear it"} />
+-              {!a.message_verified && <span className="chip bg-amber-50 text-amber-700">Tamil wording not yet checked by a native speaker</span>}
++              <PlayBtn path={phrasePath(a.phrase, lang)} clips={clips} label={word("hear", lang)} />
++              {!a.message_verified && <span className="chip bg-amber-50 text-amber-700">Translated wording · not yet checked by a native speaker</span>}
+             </div>
+           </div>
+         </div>
+@@ -318,7 +323,7 @@ export function AnswerCard({ a, clips }) {
+           <li key={m.instruction_id} className="rounded-xl bg-canvas p-3">
+             <div className="flex items-start gap-3">
+               <p className="min-w-0 flex-1 text-[17px] leading-relaxed text-ink">{m.text}</p>
+-              <PlayBtn path={audioPath(m.instruction_id, m.text_lang)} clips={clips} label={m.text_lang === "ta" ? "கேளுங்கள்" : "Hear it"} />
++              <PlayBtn path={audioPath(m.instruction_id, m.text_lang)} clips={clips} label={word("hear", m.text_lang)} />
+             </div>
+             <p className="mt-2 text-xs text-muted"><span className="font-semibold">Source, what the doctor said:</span> “{m.source_sentence || m.english}”</p>
+             {m.text_lang === "ta" && !m.translation_verified && <span className="chip mt-2 bg-amber-50 text-amber-700"><AlertTriangle className="h-3 w-3" /> Machine translation · not yet checked</span>}
+diff --git a/frontend/src/components/VoiceMode.jsx b/frontend/src/components/VoiceMode.jsx
+new file mode 100644
+index 0000000..d110ba5
+--- /dev/null
++++ b/frontend/src/components/VoiceMode.jsx
+@@ -0,0 +1,235 @@
++import { useCallback, useEffect, useRef, useState } from "react";
++import { Mic, MicOff, Phone, X } from "lucide-react";
++import { api, blobErrorMessage, errorMessage } from "../services/api";
++import { audioPath, phrasePath } from "./VisitCards";
++import { useLanguages, word } from "../hooks/useLanguages";
++
++/**
++ * Hands-free voice conversation (like ChatGPT voice mode):
++ * listen -> detect end of speech -> ElevenLabs speech-to-text -> safety rules + confirmed instructions
++ * -> ElevenLabs voice reply -> listen again. Emergencies stop the loop and show Call 108.
++ */
++const SILENCE_MS = 1300;
++const MAX_UTTERANCE_MS = 30000;
++const IDLE_RESTART_MS = 20000;
++
++function pickMime() {
++  if (typeof MediaRecorder === "undefined") return "";
++  return ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((t) => MediaRecorder.isTypeSupported?.(t)) || "";
++}
++
++export default function VoiceMode({ lang, onClose, onExchange }) {
++  const { byCode } = useLanguages();
++  const [state, setState] = useState("starting"); // starting|listening|hearing|thinking|speaking|paused|emergency|error
++  const [level, setLevel] = useState(0);
++  const [heard, setHeard] = useState("");
++  const [reply, setReply] = useState("");
++  const [replyNote, setReplyNote] = useState("");
++  const [error, setError] = useState("");
++  const [matchLang, setMatchLang] = useState(true); // reply in the language I speak
++  const [spokenLang, setSpokenLang] = useState(null);
++
++  const st = useRef("starting");
++  const stream = useRef(null);
++  const ctx = useRef(null);
++  const analyser = useRef(null);
++  const rec = useRef(null);
++  const chunks = useRef([]);
++  const raf = useRef(null);
++  const timing = useRef({});
++  const audio = useRef(null);
++  const alive = useRef(true);
++  const matchLangRef = useRef(true);
++  matchLangRef.current = matchLang;
++  const ctxRef = useRef({});
++  ctxRef.current = { lang, byCode, onExchange };
++
++  const set = (s) => { st.current = s; setState(s); };
++
++  const stopRecorder = (discard) => new Promise((resolve) => {
++    const r = rec.current;
++    if (!r || r.state === "inactive") { resolve(null); return; }
++    r.onstop = () => resolve(discard ? null : new Blob(chunks.current, { type: r.mimeType || "audio/webm" }));
++    r.stop();
++  });
++
++  const listen = useCallback(() => {
++    if (!alive.current || !stream.current) return;
++    const mime = pickMime();
++    const r = new MediaRecorder(stream.current, mime ? { mimeType: mime } : undefined);
++    chunks.current = [];
++    r.ondataavailable = (e) => e.data.size && chunks.current.push(e.data);
++    r.start(200);
++    rec.current = r;
++    timing.current = { start: performance.now(), floor: 0.008, speech: 0, last: 0 };
++    set("listening");
++  }, []);
++
++  const speakPaths = async (paths) => {
++    for (const p of paths) {
++      if (!alive.current || st.current !== "speaking") return;
++      try {
++        const blob = (await api.get(p, { responseType: "blob" })).data;
++        const url = URL.createObjectURL(blob);
++        await new Promise((resolve) => {
++          const a = new Audio(url);
++          audio.current = a;
++          a.onended = resolve; a.onerror = resolve; a.onpause = resolve;
++          a.play().catch(resolve);
++        });
++        URL.revokeObjectURL(url);
++      } catch (e) {
++        setReplyNote(await blobErrorMessage(e, "Couldn't play the voice reply."));
++        return;
++      }
++    }
++  };
++
++  const handleUtterance = useCallback(async () => {
++    set("thinking");
++    const blob = await stopRecorder(false);
++    if (!blob || blob.size < 2000) { listen(); return; }
++    try {
++      const fd = new FormData();
++      fd.append("file", blob, `voice.${blob.type.includes("mp4") ? "m4a" : "webm"}`);
++      const t = (await api.post("/api/voice/transcribe", fd)).data;
++      if (!alive.current) return;
++      const text = (t.text || "").trim();
++      if (!text) { listen(); return; }
++      setHeard(text);
++      setSpokenLang(t.lang || null);
++      const { lang: chosen, byCode: known, onExchange: report } = ctxRef.current;
++      const answerLang = matchLangRef.current && t.lang && known[t.lang] ? t.lang : chosen;
++      const a = (await api.post("/api/visits/ask", { question: text, lang: answerLang })).data;
++      if (!alive.current) return;
++      report?.(text, a);
++      const shown = a.matches?.length ? a.matches.map((m) => m.text).join(" ") : a.message;
++      setReply(shown);
++      setReplyNote(a.type === "grounded" ? `From ${a.matches[0].doctor_name || "your doctor"}'s instructions${a.matches.some((m) => m.text_lang !== "en" && !m.translation_verified) ? " · machine translation, not yet checked" : ""}`
++        : a.type === "emergency" ? (a.message_english || "") : "");
++      const paths = a.matches?.length ? a.matches.map((m) => audioPath(m.instruction_id, m.text_lang)) : [phrasePath(a.phrase, answerLang)];
++      set("speaking");
++      await speakPaths(paths);
++      if (!alive.current) return;
++      if (a.type === "emergency") { set("emergency"); return; }
++      if (st.current === "speaking") listen();
++    } catch (e) {
++      setError(errorMessage(e));
++      set("paused");
++    }
++  }, [listen]); // eslint-disable-line
++
++  // voice-activity detection loop
++  const tick = useCallback(() => {
++    raf.current = requestAnimationFrame(tick);
++    const an = analyser.current;
++    if (!an) return;
++    const buf = new Float32Array(an.fftSize);
++    an.getFloatTimeDomainData(buf);
++    let sum = 0;
++    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
++    const rms = Math.sqrt(sum / buf.length);
++    setLevel(rms);
++    const s = st.current;
++    if (s !== "listening" && s !== "hearing") return;
++    const now = performance.now(), tm = timing.current;
++    if (now - tm.start < 400) { tm.floor = Math.max(tm.floor, rms); return; } // calibrate room noise
++    const threshold = Math.max(0.02, tm.floor * 2.2);
++    if (rms > threshold) {
++      if (!tm.speech) { tm.speech = now; set("hearing"); }
++      tm.last = now;
++    }
++    if (tm.speech && (now - tm.last > SILENCE_MS || now - tm.speech > MAX_UTTERANCE_MS)) {
++      handleUtterance();
++    } else if (!tm.speech && now - tm.start > IDLE_RESTART_MS) {
++      tm.start = Infinity; // run once
++      stopRecorder(true).then(listen); // keep recordings short while nobody is talking
++    }
++  }, [handleUtterance, listen]);
++
++  useEffect(() => {
++    alive.current = true;
++    (async () => {
++      try {
++        stream.current = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
++      } catch (e) {
++        setError(e?.name === "NotAllowedError" ? "Microphone permission was blocked. Allow it in the browser's address bar." : "No microphone found.");
++        set("error");
++        return;
++      }
++      const AC = window.AudioContext || window.webkitAudioContext;
++      ctx.current = new AC();
++      analyser.current = ctx.current.createAnalyser();
++      analyser.current.fftSize = 1024;
++      ctx.current.createMediaStreamSource(stream.current).connect(analyser.current);
++      listen();
++      tick();
++    })();
++    return () => {
++      alive.current = false;
++      cancelAnimationFrame(raf.current);
++      try { rec.current?.state !== "inactive" && rec.current?.stop(); } catch { /* ignore */ }
++      audio.current?.pause();
++      stream.current?.getTracks().forEach((t) => t.stop());
++      ctx.current?.close().catch(() => {});
++    };
++  }, []); // eslint-disable-line
++
++  const pause = async () => { audio.current?.pause(); await stopRecorder(true); set("paused"); };
++  const resume = () => { setError(""); listen(); };
++  const interrupt = async () => { if (st.current === "speaking") { set("listening"); audio.current?.pause(); listen(); } };
++
++  const label = {
++    starting: "Starting the microphone…", listening: word("listening", lang), hearing: word("listening", lang),
++    thinking: "Finding it in your doctor's instructions…", speaking: "Speaking · tap the circle to interrupt",
++    paused: "Paused", emergency: "Emergency", error: "Microphone unavailable",
++  }[state];
++  const scale = state === "hearing" || state === "listening" ? 1 + Math.min(0.45, level * 6) : 1;
++  const orb = { speaking: "animate-pulse", thinking: "animate-spin [animation-duration:2.5s]" }[state] || "";
++  const langName = spokenLang && byCode[spokenLang] ? byCode[spokenLang].native : null;
++
++  return (
++    <div className="fixed inset-0 z-50 flex flex-col bg-navy text-white" role="dialog" aria-label="Voice conversation">
++      <div className="flex items-center justify-between px-5 py-4">
++        <p className="text-sm font-semibold text-navy-100">Voice conversation · ElevenLabs</p>
++        <label className="flex items-center gap-2 text-xs text-navy-100">
++          <input type="checkbox" checked={matchLang} onChange={(e) => setMatchLang(e.target.checked)} className="h-4 w-4" />
++          Reply in the language I speak
++        </label>
++      </div>
++
++      <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
++        {state === "emergency" ? (
++          <div className="max-w-md">
++            <p className="text-2xl font-semibold leading-snug">{reply}</p>
++            {replyNote && <p className="mt-2 text-sm text-red-200">{replyNote}</p>}
++            <a href="tel:108" className="mt-6 inline-flex items-center gap-3 rounded-full bg-red-600 px-8 py-4 text-xl font-bold shadow-xl"><Phone className="h-6 w-6" /> Call 108</a>
++            <p className="mt-4 text-xs text-navy-100">MediMemory does not look at your records in an emergency.</p>
++          </div>
++        ) : (
++          <>
++            <button onClick={interrupt} aria-label="Voice orb" className="relative flex h-48 w-48 items-center justify-center sm:h-56 sm:w-56">
++              {(state === "listening" || state === "hearing") && <span className="absolute inset-0 animate-pulseRing rounded-full bg-teal/40" />}
++              <span className={`absolute inset-0 rounded-full bg-orb shadow-glow transition-transform duration-100 ${orb}`} style={{ transform: `scale(${scale})` }} />
++              {state === "paused" && <MicOff className="relative h-12 w-12" />}
++            </button>
++            <p className="mt-10 text-lg font-semibold">{label}</p>
++            {langName && <p className="mt-1 text-xs text-navy-100">Heard in {langName}</p>}
++            {heard && <p className="mt-6 max-w-xl text-base text-navy-100">“{heard}”</p>}
++            {reply && <p className="mt-4 max-w-xl text-xl leading-relaxed">{reply}</p>}
++            {replyNote && <p className="mt-2 max-w-xl text-xs text-amber-200">{replyNote}</p>}
++            {error && <p className="mt-4 max-w-md rounded-xl bg-red-500/20 px-4 py-2 text-sm text-red-100">{error}</p>}
++          </>
++        )}
++      </div>
++
++      <div className="flex items-center justify-center gap-6 pb-10 pt-4">
++        {state === "paused" || state === "emergency" || state === "error"
++          ? <button onClick={resume} disabled={state === "error"} className="flex h-16 w-16 items-center justify-center rounded-full bg-white/10 disabled:opacity-40" aria-label="Resume listening"><Mic className="h-7 w-7" /></button>
++          : <button onClick={pause} className="flex h-16 w-16 items-center justify-center rounded-full bg-white/10" aria-label="Pause"><MicOff className="h-7 w-7" /></button>}
++        <button onClick={onClose} className="flex h-16 w-16 items-center justify-center rounded-full bg-red-600" aria-label="End voice conversation"><X className="h-8 w-8" /></button>
++      </div>
++      <p className="pb-4 text-center text-[11px] text-navy-100/80">Repeats only what your doctor told you. Not for emergencies: call 108.</p>
++    </div>
++  );
++}
+diff --git a/frontend/src/hooks/useLanguages.js b/frontend/src/hooks/useLanguages.js
+new file mode 100644
+index 0000000..25ac81c
+--- /dev/null
++++ b/frontend/src/hooks/useLanguages.js
+@@ -0,0 +1,31 @@
++import { useEffect, useState } from "react";
++import { api } from "../services/api";
++
++let cached = null;
++const FALLBACK = [
++  { code: "en", name: "English", native: "English", group: "india" },
++  { code: "ta", name: "Tamil", native: "தமிழ்", group: "india" },
++];
++
++/** Languages the server can translate into and speak (from ElevenLabs' supported list). */
++export function useLanguages() {
++  const [langs, setLangs] = useState(cached || FALLBACK);
++  useEffect(() => {
++    if (cached) return;
++    api.get("/api/visits/languages").then((r) => {
++      if (Array.isArray(r.data?.languages) && r.data.languages.length) { cached = r.data.languages; setLangs(cached); }
++    }).catch(() => {});
++  }, []);
++  const byCode = Object.fromEntries(langs.map((l) => [l.code, l]));
++  return { langs, byCode };
++}
++
++/** A few UI words in the user's language; other languages fall back to English. */
++const WORDS = {
++  hear: { en: "Hear it", ta: "கேளுங்கள்", hi: "सुनिए" },
++  playAll: { en: "Play all", ta: "எல்லாம் கேளுங்கள்", hi: "सब सुनिए" },
++  ask: { en: "Ask a question…", ta: "கேள்வி கேளுங்கள்…", hi: "सवाल पूछिए…" },
++  hello: { en: "Vanakkam", ta: "வணக்கம்", hi: "नमस्ते" },
++  listening: { en: "Listening…", ta: "கேட்கிறேன்…", hi: "सुन रहा हूँ…" },
++};
++export const word = (key, lang) => WORDS[key]?.[lang] || WORDS[key]?.en || key;
+diff --git a/frontend/src/pages/ChatHome.jsx b/frontend/src/pages/ChatHome.jsx
+index d585ef6..063ffe4 100644
+--- a/frontend/src/pages/ChatHome.jsx
++++ b/frontend/src/pages/ChatHome.jsx
+@@ -1,6 +1,9 @@
+ import { useCallback, useEffect, useRef, useState } from "react";
+ import { useNavigate, useSearchParams } from "react-router-dom";
+-import { ArrowUp, FileText, Loader2, Mic, Paperclip, Plus, ShieldCheck, Sparkles, Square, Stethoscope, Upload, X } from "lucide-react";
++import { ArrowUp, AudioLines, FileText, Loader2, Mic, Paperclip, Plus, ShieldCheck, Sparkles, Square, Stethoscope, Upload, X } from "lucide-react";
++import LanguagePicker from "../components/LanguagePicker";
++import VoiceMode from "../components/VoiceMode";
++import { word } from "../hooks/useLanguages";
+ import {
+   AnswerCard, Bubble, InstructionsCard, ReviewCard, Steps, UserBubble, audioPath, phrasePath,
+ } from "../components/VisitCards";
+@@ -40,7 +43,7 @@ export default function ChatHome() {
+   const [params, setParams] = useSearchParams();
+   const storeKey = `mm_thread_${user.id}`;
+   const [lang, setLang] = useState(() => {
+-    try { return localStorage.getItem("mm_lang") || (user.profile?.preferred_language === "ta" ? "ta" : "en"); } catch { return "en"; }
++    try { return localStorage.getItem("mm_lang") || user.profile?.preferred_language || "en"; } catch { return "en"; }
+   });
+   const [thread, setThread] = useState(() => {
+     try { return JSON.parse(sessionStorage.getItem(storeKey) || "[]").filter((m) => !["progress", "recordSetup"].includes(m.kind)); } catch { return []; }
+@@ -50,6 +53,7 @@ export default function ChatHome() {
+   const [busy, setBusy] = useState(false);
+   const [menu, setMenu] = useState(false);
+   const [drag, setDrag] = useState(false);
++  const [voiceMode, setVoiceMode] = useState(false);
+   const recMode = useRef(null); // "visit" | "question"
+   const recSetupId = useRef(null);
+   const fileRef = useRef(null);
+@@ -320,7 +324,7 @@ export default function ChatHome() {
+         return <ReviewCard visit={v} toast={toast} onChange={putVisit} onDiscard={() => discard(v.id, m.id)}
+           onConfirmed={(cv) => {
+             visitsChanged();
+-            push({ role: "assistant", kind: "note", text: lang === "ta" ? "சேமிக்கப்பட்டது. கீழே உங்கள் மொழியில் கேளுங்கள்." : "Saved. You can now hear it in your language and ask questions about it.", tone: "ok" });
++            push({ role: "assistant", kind: "note", text: "Saved. You can now hear it in your language and ask questions about it.", tone: "ok" });
+             if (consent) api.post(`/api/visits/${cv.id}/prewarm`, { langs: ["en"] }).catch(() => {});
+           }} />;
+       }
+@@ -341,6 +345,10 @@ export default function ChatHome() {
+     <div className="relative flex h-[calc(100dvh-65px)] flex-col"
+       onDragOver={(e) => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)}
+       onDrop={(e) => { e.preventDefault(); setDrag(false); uploadFile(e.dataTransfer.files?.[0]); }}>
++      {voiceMode && (
++        <VoiceMode lang={lang} onClose={() => setVoiceMode(false)}
++          onExchange={(q, a) => { push({ role: "user", kind: "voice", text: q }); push({ role: "assistant", kind: "answer", a }); }} />
++      )}
+       {drag && (
+         <div className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-3xl border-2 border-dashed border-teal bg-teal-50/90 text-lg font-semibold text-teal-700">
+           Drop your prescription or report here
+@@ -350,12 +358,7 @@ export default function ChatHome() {
+       {/* top bar: language */}
+       <div className="flex items-center justify-between gap-3 border-b border-line/70 bg-white px-4 py-2.5 sm:px-6">
+         <p className="text-sm font-semibold text-ink">Ask MediMemory</p>
+-        <div className="flex rounded-full bg-canvas p-1 text-sm font-semibold" role="group" aria-label="Language">
+-          {[["en", "English"], ["ta", "தமிழ்"]].map(([k, label]) => (
+-            <button key={k} onClick={() => { setLang(k); clips.stop(); }} aria-pressed={lang === k}
+-              className={`rounded-full px-4 py-1.5 transition ${lang === k ? "bg-teal text-white shadow" : "text-muted hover:text-ink"}`}>{label}</button>
+-          ))}
+-        </div>
++        <LanguagePicker value={lang} onChange={(v) => { setLang(v); clips.stop(); }} />
+       </div>
+ 
+       {/* thread */}
+@@ -364,7 +367,7 @@ export default function ChatHome() {
+           {thread.length === 0 && (
+             <div className="pt-1 text-center sm:pt-4">
+               <span className="mx-auto hidden h-14 w-14 items-center justify-center rounded-full bg-orb text-white shadow-glow sm:flex"><Sparkles className="h-6 w-6" /></span>
+-              <h1 className="mt-2 text-2xl sm:mt-5 font-semibold text-ink sm:text-3xl">{lang === "ta" ? "வணக்கம்" : "Vanakkam"}, {firstName}</h1>
++              <h1 className="mt-2 text-2xl sm:mt-5 font-semibold text-ink sm:text-3xl">{word("hello", lang)}, {firstName}</h1>
+               <p className="mx-auto mt-2 max-w-md text-sm text-muted sm:text-base">Never miss what your doctor told you. Record the visit or upload the prescription, check it once, then hear it in your language any time.</p>
+               <div className="mt-5 grid gap-2 text-left sm:mt-6 sm:grid-cols-3 sm:gap-3">
+                 <button onClick={openRecordSetup} className="card grid grid-cols-[auto_1fr] items-center gap-x-3 p-3 text-left transition hover:border-teal hover:shadow-lg sm:flex sm:flex-col sm:items-start sm:gap-2 sm:p-4">
+@@ -401,13 +404,13 @@ export default function ChatHome() {
+         <div className="mx-auto max-w-3xl">
+           {thread.length === 0 && lastConfirmed && (
+             <div className="-mx-1 mb-2 flex gap-2 overflow-x-auto px-1 pb-1">
+-              {SUGGEST[lang].map((s) => <button key={s} className="shrink-0 whitespace-nowrap rounded-full border border-line bg-white px-3 py-1.5 text-xs font-medium text-navy hover:border-teal" onClick={() => ask(s)}>{s}</button>)}
++              {(SUGGEST[lang] || SUGGEST.en).map((s) => <button key={s} className="shrink-0 whitespace-nowrap rounded-full border border-line bg-white px-3 py-1.5 text-xs font-medium text-navy hover:border-teal" onClick={() => ask(s)}>{s}</button>)}
+             </div>
+           )}
+           {recordingQuestion ? (
+             <div className="flex items-center gap-3 rounded-3xl border-2 border-teal bg-teal-50 px-4 py-3">
+               <span className="relative flex h-3 w-3"><span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" /><span className="relative inline-flex h-3 w-3 rounded-full bg-red-600" /></span>
+-              <span className="text-sm font-semibold text-teal-700">{lang === "ta" ? "கேட்கிறேன்…" : "Listening…"} {mmss(rec.seconds)}</span>
++              <span className="text-sm font-semibold text-teal-700">{word("listening", lang)} {mmss(rec.seconds)}</span>
+               <div className="flex h-8 flex-1 items-center gap-[3px]" aria-hidden="true">
+                 {rec.levels.map((l, i) => <span key={i} className="w-[3px] rounded-full bg-teal" style={{ height: `${Math.max(3, l * 30)}px` }} />)}
+               </div>
+@@ -431,17 +434,24 @@ export default function ChatHome() {
+               <textarea ref={inputRef} rows={1} value={input} disabled={busy}
+                 onChange={(e) => setInput(e.target.value)}
+                 onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(input); } }}
+-                placeholder={lang === "ta" ? "கேள்வி கேளுங்கள்…" : "Ask a question…"}
++                placeholder={word("ask", lang)}
+                 className="max-h-40 min-h-[44px] flex-1 resize-none bg-transparent px-1 py-2.5 text-[16px] text-ink placeholder:text-muted/70 focus:outline-none" aria-label="Your question" />
+               {input.trim() ? (
+                 <button className="flex h-11 w-11 items-center justify-center rounded-full bg-navy text-white disabled:opacity-50" disabled={busy} aria-label="Send" onClick={() => ask(input)}>
+                   {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <ArrowUp className="h-5 w-5" />}
+                 </button>
+               ) : (
+-                <button className="flex h-12 w-12 items-center justify-center rounded-full bg-teal text-white shadow-lg shadow-teal/30 disabled:opacity-50" disabled={busy || rec.state !== "idle"}
+-                  aria-label="Ask by voice" onClick={startQuestion}>
+-                  {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Mic className="h-6 w-6" />}
+-                </button>
++                <>
++                  <button className="flex h-11 w-11 items-center justify-center rounded-full text-navy hover:bg-canvas disabled:opacity-50" disabled={busy || rec.state !== "idle"}
++                    aria-label="Dictate a question" title="Dictate a question" onClick={startQuestion}>
++                    <Mic className="h-6 w-6" />
++                  </button>
++                  <button className="flex h-12 w-12 items-center justify-center rounded-full bg-teal text-white shadow-lg shadow-teal/30 disabled:opacity-50" disabled={busy || rec.state !== "idle"}
++                    aria-label="Talk with MediMemory (voice conversation)" title="Voice conversation"
++                    onClick={() => { if (!needConsent()) { clips.stop(); setVoiceMode(true); } }}>
++                    {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <AudioLines className="h-6 w-6" />}
++                  </button>
++                </>
+               )}
+             </div>
+           )}
+diff --git a/frontend/src/test/chat.test.jsx b/frontend/src/test/chat.test.jsx
+index 01a1ef6..e55720d 100644
+--- a/frontend/src/test/chat.test.jsx
++++ b/frontend/src/test/chat.test.jsx
+@@ -37,10 +37,29 @@ describe("chat home", () => {
+     mount();
+     expect(await screen.findByText("Record my doctor visit")).toBeInTheDocument();
+     expect(screen.getByText("Upload a prescription")).toBeInTheDocument();
+-    expect(screen.getByLabelText("Ask by voice")).toBeInTheDocument();
+-    expect(screen.getByRole("button", { name: "தமிழ்" })).toHaveAttribute("aria-pressed", "true");
++    expect(screen.getByLabelText("Dictate a question")).toBeInTheDocument();
++    expect(screen.getByLabelText("Talk with MediMemory (voice conversation)")).toBeInTheDocument();
++    expect(screen.getByLabelText("Answer language")).toHaveValue("ta");
+     expect(await screen.findByText(/Metformin 500 mg\./)).toBeInTheDocument();
+-    expect(screen.getByText(/not yet checked by a Tamil speaker/)).toBeInTheDocument();
++    expect(screen.getByText(/not yet checked by a native speaker/)).toBeInTheDocument();
++  });
++
++  it("asks for AI consent before opening the voice conversation", async () => {
++    mount();
++    await userEvent.click(await screen.findByLabelText("Talk with MediMemory (voice conversation)"));
++    expect(screen.getByText("One permission first")).toBeInTheDocument();
++    expect(screen.queryByRole("dialog", { name: "Voice conversation" })).toBeNull();
++  });
++
++  it("offers many languages, Indian languages first", async () => {
++    sessionStorage.setItem("medimemory_token", "tok");
++    const LANGS = [{ code: "en", name: "English", native: "English", group: "india" }, { code: "ta", name: "Tamil", native: "தமிழ்", group: "india" },
++      { code: "te", name: "Telugu", native: "తెలుగు", group: "india" }, { code: "ar", name: "Arabic", native: "العربية", group: "world" }];
++    api.get.mockImplementation((url) => Promise.resolve({ data: url === "/api/auth/me" ? USER : url === "/api/visits" ? [] : url === "/api/visits/languages" ? { languages: LANGS } : [] }));
++    render(<MemoryRouter initialEntries={["/app"]}><ToastProvider><AuthProvider><Routes>
++      <Route path="/app" element={<Gate />} /></Routes></AuthProvider></ToastProvider></MemoryRouter>);
++    expect(await screen.findByRole("option", { name: /తెలుగు/ })).toBeInTheDocument();
++    expect(screen.getByRole("option", { name: /العربية/ })).toBeInTheDocument();
+   });
+ 
+   it("asks for AI consent before recording", async () => {
+@@ -54,7 +73,7 @@ describe("chat home", () => {
+     await screen.findByText("Record my doctor visit");
+     api.post.mockResolvedValueOnce({ data: { type: "emergency", reason: "emergency", lang: "en", matches: [], phrase: "emergency",
+       message: "This could be an emergency. Please call 108 or go to the nearest hospital now." } });
+-    await userEvent.click(screen.getByRole("button", { name: "English" }));
++    await userEvent.selectOptions(screen.getByLabelText("Answer language"), "en");
+     await userEvent.type(screen.getByLabelText("Your question"), "I have chest pain{enter}");
+     expect(await screen.findByText(/call 108/)).toBeInTheDocument();
+     expect(screen.getByRole("link", { name: /Call 108/ })).toHaveAttribute("href", "tel:108");
+-- 
+2.43.0
+

@@ -1,0 +1,1630 @@
+From e5fa74b4039a0e569aaa0349c7f87a742426746f Mon Sep 17 00:00:00 2001
+From: MediMemory team <team@medimemory.local>
+Date: Wed, 25 Nov 2026 17:40:38 +0000
+Subject: [PATCH 1/3] After-visit core loop: consented recording, verified
+ extraction, translation, cached TTS, grounded Ask with safety rules
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01URxMv78p3mykqFwFA9FPJW
+---
+ .env.example                       |   5 +
+ .gitignore                         |   1 +
+ backend/app/api/visits.py          | 453 +++++++++++++++++++++++++++++
+ backend/app/api/voice.py           |   5 +-
+ backend/app/core/config.py         |   2 +
+ backend/app/core/llm.py            |  43 +++
+ backend/app/core/ratelimit.py      |  36 +++
+ backend/app/main.py                |   4 +-
+ backend/app/models/__init__.py     |   1 +
+ backend/app/models/visits.py       |  77 +++++
+ backend/app/safety/__init__.py     |   1 +
+ backend/app/safety/rules.py        | 120 ++++++++
+ backend/app/services/visit_ai.py   | 199 +++++++++++++
+ backend/app/voice/elevenlabs.py    |   4 +-
+ backend/tests/test_safety_rules.py |  77 +++++
+ backend/tests/test_visits_flow.py  | 248 ++++++++++++++++
+ docs/FINALS_STAGING.md             |  21 ++
+ scripts/core_loop_check.py         | 119 ++++++++
+ 18 files changed, 1410 insertions(+), 6 deletions(-)
+ create mode 100644 backend/app/api/visits.py
+ create mode 100644 backend/app/core/llm.py
+ create mode 100644 backend/app/core/ratelimit.py
+ create mode 100644 backend/app/models/visits.py
+ create mode 100644 backend/app/safety/__init__.py
+ create mode 100644 backend/app/safety/rules.py
+ create mode 100644 backend/app/services/visit_ai.py
+ create mode 100644 backend/tests/test_safety_rules.py
+ create mode 100644 backend/tests/test_visits_flow.py
+ create mode 100644 docs/FINALS_STAGING.md
+ create mode 100644 scripts/core_loop_check.py
+
+diff --git a/.env.example b/.env.example
+index 5ecf1ed..3936078 100644
+--- a/.env.example
++++ b/.env.example
+@@ -22,6 +22,8 @@ ELEVENLABS_STT_MODEL=scribe_v1
+ ELEVENLABS_TTS_MODEL=eleven_multilingual_v2
+ # Default voice ("Rachel" premade). Users can pick another voice in Settings.
+ ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM
++# Optional: a separate voice for Tamil playback (choose one in the ElevenLabs Voice Library that sounds natural in Tamil)
++ELEVENLABS_VOICE_ID_TA=
+ 
+ # --- LLM (optional but recommended) ----------------------------------
+ # Any OpenAI-compatible chat completions API. Without a key the assistant
+@@ -29,6 +31,9 @@ ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM
+ LLM_API_KEY=
+ LLM_BASE_URL=https://api.openai.com/v1
+ LLM_MODEL=gpt-4o-mini
++# Google Gemini (free tier key from Google AI Studio) via its OpenAI-compatible endpoint:
++# LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
++# LLM_MODEL=<current Flash model name shown in AI Studio>
+ # Embeddings: "local" (offline, default) or "openai" (uses LLM_API_KEY + LLM_BASE_URL)
+ EMBEDDING_PROVIDER=local
+ EMBEDDING_MODEL=text-embedding-3-small
+diff --git a/.gitignore b/.gitignore
+index 90f88ff..248e029 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,3 +10,4 @@ frontend/dist/
+ *.log
+ # Local secrets written by `elevenlabs onboard`
+ /.env.local
++core_loop_results.json
+diff --git a/backend/app/api/visits.py b/backend/app/api/visits.py
+new file mode 100644
+index 0000000..d7d0e4d
+--- /dev/null
++++ b/backend/app/api/visits.py
+@@ -0,0 +1,453 @@
++"""After-visit loop: Record (consent) -> transcribe -> extract -> review/edit -> confirm -> translate -> hear -> ask.
++
++Endpoints (all require login; data is always scoped to the signed-in patient):
++  POST   /api/visits/record                 multipart audio + consent=true  -> draft visit with transcript
++  POST   /api/visits/typed                  json transcript (typed / pasted)  -> draft visit
++  POST   /api/visits/{id}/extract           LLM (or rules) -> draft instructions, each traced to the transcript
++  PUT    /api/visits/{id}/instructions      patient edits the draft
++  POST   /api/visits/{id}/confirm           only now is anything saved as the patient's record
++  DELETE /api/visits/{id}                   discard
++  GET    /api/visits, /api/visits/{id}
++  POST   /api/visits/{id}/translate         machine translation of CONFIRMED instructions (marked unverified)
++  PUT    /api/visits/instructions/{iid}/translations/{lang}   human edit / mark verified
++  GET    /api/visits/instructions/{iid}/audio?lang=ta        cached ElevenLabs TTS for one instruction
++  GET    /api/visits/phrases/{kind}/audio?lang=ta            cached TTS for fixed safety messages
++  POST   /api/visits/{id}/prewarm           generate + cache all audio for a visit (demo prep)
++  POST   /api/visits/ask                    safety rules -> match confirmed instructions only
++"""
++from __future__ import annotations
++
++import hashlib
++import re
++import time
++from datetime import date
++
++from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
++from fastapi.responses import Response
++from pydantic import BaseModel, Field
++from sqlalchemy import select
++from sqlalchemy.orm import Session, selectinload
++
++from app.core.config import settings
++from app.core.deps import client_ip, get_current_user
++from app.core.llm import LLMUnavailable
++from app.core.ratelimit import limit
++from app.database.session import get_db
++from app.models import Consultation, DoctorInstruction, User, utcnow
++from app.models.visits import CATEGORIES, AudioClip, InstructionTranslation, Visit, VisitInstruction
++from app.rag.indexer import index_source
++from app.safety import TAMIL_TEXT_VERIFIED, classify, message
++from app.services import visit_ai
++from app.services.audit import audit
++from app.voice import elevenlabs as el
++
++router = APIRouter(prefix="/api/visits", tags=["visits"])
++LANGS = ("en", "ta")
++MAX_AUDIO = 25 * 1024 * 1024
++AUDIO_TYPES = ("audio/", "video/webm", "video/mp4", "application/octet-stream")
++
++
++# ------------------------------------------------------------------ schemas
++class TypedIn(BaseModel):
++    transcript: str = Field(min_length=10, max_length=20000)
++    doctor_name: str = Field(default="", max_length=120)
++    visit_date: date | None = None
++    source: str = Field(default="typed", pattern="^(typed|sample)$")
++
++
++class InstructionIn(BaseModel):
++    id: int | None = None
++    category: str = "other"
++    source_sentence: str = Field(default="", max_length=2000)
++    simple_text: str = Field(min_length=2, max_length=600)
++
++
++class InstructionsIn(BaseModel):
++    doctor_name: str | None = Field(default=None, max_length=120)
++    visit_date: date | None = None
++    instructions: list[InstructionIn] = Field(max_length=30)
++
++
++class TranslateIn(BaseModel):
++    lang: str = Field(pattern="^(en|ta)$")
++
++
++class TranslationEditIn(BaseModel):
++    text: str = Field(min_length=1, max_length=1000)
++    verified: bool = False
++    reviewer: str | None = Field(default=None, max_length=120)
++
++
++class AskIn(BaseModel):
++    question: str = Field(min_length=2, max_length=500)
++    lang: str = Field(default="en", pattern="^(en|ta)$")
++
++
++class PrewarmIn(BaseModel):
++    langs: list[str] = Field(default_factory=lambda: ["en", "ta"])
++
++
++# ------------------------------------------------------------------ helpers
++def _ai_consent(user: User) -> None:
++    if not (user.profile and user.profile.ai_data_consent):
++        raise HTTPException(403, "This sends text or audio to AI and voice services. Turn on 'AI & voice processing' in Settings first.")
++
++
++def _get(db: Session, user: User, vid: int) -> Visit:
++    v = db.scalar(select(Visit).options(selectinload(Visit.instructions).selectinload(VisitInstruction.translations))
++                  .where(Visit.id == vid, Visit.owner_id == user.id))
++    if not v:
++        raise HTTPException(404, "Visit not found.")
++    return v
++
++
++def _draft(v: Visit) -> None:
++    if v.status != "draft":
++        raise HTTPException(409, "This visit is already confirmed. Confirmed instructions can't be changed here.")
++
++
++def _tr(ins: VisitInstruction, lang: str) -> InstructionTranslation | None:
++    return next((t for t in ins.translations if t.lang == lang), None)
++
++
++def _text(ins: VisitInstruction, lang: str) -> tuple[str | None, bool]:
++    """Text to show/speak in a language and whether it is verified."""
++    if lang == "en":
++        return ins.simple_text, True
++    t = _tr(ins, lang)
++    return (t.text, t.verified) if t else (None, False)
++
++
++def _ins_out(ins: VisitInstruction) -> dict:
++    return {
++        "id": ins.id, "position": ins.position, "category": ins.category, "source_sentence": ins.source_sentence,
++        "simple_text": ins.simple_text, "needs_check": ins.needs_check, "check_reason": ins.check_reason,
++        "edited_by_user": ins.edited_by_user,
++        "translations": {t.lang: {"text": t.text, "method": t.method, "verified": t.verified, "verified_by": t.verified_by}
++                         for t in ins.translations},
++    }
++
++
++def _out(v: Visit) -> dict:
++    return {
++        "id": v.id, "doctor_name": v.doctor_name, "visit_date": v.visit_date.isoformat(), "status": v.status,
++        "source": v.source, "recording_consent_at": v.recording_consent_at.isoformat() if v.recording_consent_at else None,
++        "transcript": v.transcript, "transcript_language": v.transcript_language,
++        "extraction_method": v.extraction_method, "confirmed_at": v.confirmed_at.isoformat() if v.confirmed_at else None,
++        "instructions": [_ins_out(i) for i in v.instructions],
++        "tamil_ui_text_verified": TAMIL_TEXT_VERIFIED,
++    }
++
++
++def _voice_for(lang: str, user: User) -> str:
++    if lang == "ta" and settings.elevenlabs_voice_id_ta:
++        return settings.elevenlabs_voice_id_ta
++    return (user.profile.voice_id if user.profile and user.profile.voice_id else None) or settings.elevenlabs_voice_id
++
++
++def _clip_key(model: str, voice: str, lang: str, text: str) -> str:
++    return hashlib.sha256(f"{model}|{voice}|{lang}|{text}".encode()).hexdigest()
++
++
++def get_audio(db: Session, text: str, lang: str, voice: str) -> tuple[bytes, bool]:
++    """Returns (mp3 bytes, cache_hit)."""
++    model = settings.elevenlabs_tts_model
++    key = _clip_key(model, voice, lang, text)
++    clip = db.get(AudioClip, key)
++    if clip:
++        return clip.data, True
++    try:
++        data = el.synthesize(re.sub(r"[*#_`]", "", text)[:2500], voice, model)
++    except el.VoiceNotConfigured as exc:
++        raise HTTPException(503, str(exc))
++    except el.VoiceProviderError as exc:
++        raise HTTPException(exc.status, str(exc))
++    db.add(AudioClip(key=key, lang=lang, model=model, voice_id=voice, data=data))
++    db.commit()
++    return data, False
++
++
++def _mp3(data: bytes, hit: bool, verified: bool) -> Response:
++    return Response(content=data, media_type="audio/mpeg", headers={
++        "Cache-Control": "private, max-age=86400", "X-Audio-Cache": "hit" if hit else "miss",
++        "X-Translation-Verified": "true" if verified else "false",
++        "Access-Control-Expose-Headers": "X-Audio-Cache, X-Translation-Verified"})
++
++
++# ------------------------------------------------------------------ capture
++@router.post("/record", status_code=201)
++async def record(request: Request, file: UploadFile = File(...), consent: bool = Form(...),
++                 consent_note: str | None = Form(None), doctor_name: str = Form(""), visit_date: date | None = Form(None),
++                 language_code: str | None = Form(None),
++                 user: User = Depends(limit("visit_record", 6)), db: Session = Depends(get_db)):
++    if not consent:
++        raise HTTPException(400, "Recording needs the consent of everyone in the room. Please confirm consent first.")
++    _ai_consent(user)
++    audio = await file.read(MAX_AUDIO + 1)
++    if not audio:
++        raise HTTPException(400, "No audio was received. Please try again.")
++    if len(audio) > MAX_AUDIO:
++        raise HTTPException(413, "Recording is too large. Please keep it under about 15 minutes.")
++    ctype = file.content_type or "application/octet-stream"
++    if not ctype.startswith(AUDIO_TYPES):
++        raise HTTPException(415, "Unsupported audio format.")
++    if language_code and not re.fullmatch(r"[a-z]{2,3}", language_code):
++        language_code = None
++    try:
++        result = el.transcribe(audio, file.filename or "visit.webm", ctype, language_code)
++    except el.VoiceNotConfigured as exc:
++        raise HTTPException(503, str(exc))
++    except el.VoiceProviderError as exc:
++        raise HTTPException(exc.status, str(exc))
++    if not result["text"]:
++        raise HTTPException(422, "No speech was detected in the recording.")
++    # The audio itself is NOT stored; only the transcript, as a draft.
++    v = Visit(owner_id=user.id, doctor_name=doctor_name.strip()[:120], visit_date=visit_date or date.today(),
++              source="recording", recording_consent_at=utcnow(), consent_note=(consent_note or "")[:255] or None,
++              transcript=result["text"], transcript_language=result.get("language_code"))
++    db.add(v)
++    db.flush()
++    audit(db, user.id, "visit.record", "visit", v.id, detail=f"{len(audio)} bytes, audio not stored", ip=client_ip(request))
++    db.commit()
++    return _out(_get(db, user, v.id))
++
++
++@router.post("/typed", status_code=201)
++def typed(body: TypedIn, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
++    v = Visit(owner_id=user.id, doctor_name=body.doctor_name.strip(), visit_date=body.visit_date or date.today(),
++              source=body.source, transcript=body.transcript.strip())
++    db.add(v)
++    db.flush()
++    audit(db, user.id, "visit.typed", "visit", v.id, ip=client_ip(request))
++    db.commit()
++    return _out(_get(db, user, v.id))
++
++
++@router.post("/{vid}/extract")
++def extract(vid: int, request: Request, user: User = Depends(limit("visit_extract", 10)), db: Session = Depends(get_db)):
++    v = _get(db, user, vid)
++    _draft(v)
++    if settings.llm_enabled:
++        _ai_consent(user)
++    t0 = time.perf_counter()
++    method, doctor, items = visit_ai.extract(v.transcript)
++    v.instructions.clear()
++    db.flush()
++    for i, it in enumerate(items):
++        v.instructions.append(VisitInstruction(owner_id=user.id, position=i, category=it["category"],
++                                               source_sentence=it["source_sentence"], simple_text=it["simple_text"],
++                                               needs_check=it["needs_check"], check_reason=it["check_reason"]))
++    v.extraction_method = method
++    if doctor and not v.doctor_name:
++        v.doctor_name = doctor
++    audit(db, user.id, "visit.extract", "visit", v.id, detail=f"{method}, {len(items)} items", ip=client_ip(request))
++    db.commit()
++    out = _out(_get(db, user, vid))
++    out["timing_ms"] = round((time.perf_counter() - t0) * 1000)
++    return out
++
++
++@router.put("/{vid}/instructions")
++def edit_instructions(vid: int, body: InstructionsIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
++    v = _get(db, user, vid)
++    _draft(v)
++    old = {i.id: i for i in v.instructions}
++    v.instructions.clear()
++    db.flush()
++    for pos, it in enumerate(body.instructions):
++        prev = old.get(it.id) if it.id else None
++        changed = prev is None or prev.simple_text != it.simple_text or prev.source_sentence != it.source_sentence
++        checked = visit_ai.check_item({"source_sentence": it.source_sentence, "simple_text": it.simple_text}, v.transcript)
++        v.instructions.append(VisitInstruction(
++            owner_id=user.id, position=pos, category=it.category if it.category in CATEGORIES else "other",
++            source_sentence=it.source_sentence, simple_text=it.simple_text.strip(),
++            # a patient edit is the patient's own check; keep only the machine checks as a hint
++            needs_check=False if changed else checked["needs_check"],
++            check_reason=None if changed else checked["check_reason"],
++            edited_by_user=bool(prev and prev.edited_by_user) or changed))
++    if body.doctor_name is not None:
++        v.doctor_name = body.doctor_name.strip()
++    if body.visit_date:
++        v.visit_date = body.visit_date
++    db.commit()
++    return _out(_get(db, user, vid))
++
++
++@router.post("/{vid}/confirm")
++def confirm(vid: int, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
++    v = _get(db, user, vid)
++    _draft(v)
++    if not v.instructions:
++        raise HTTPException(400, "There are no instructions to confirm.")
++    c = Consultation(owner_id=user.id, doctor_name=v.doctor_name or "Doctor", consultation_date=v.visit_date,
++                     doctor_notes="Instructions confirmed by the patient after the visit.", status="confirmed")
++    c.instructions = [DoctorInstruction(text=i.simple_text) for i in v.instructions]
++    db.add(c)
++    db.flush()
++    v.consultation_id, v.status, v.confirmed_at = c.id, "confirmed", utcnow()
++    for i in v.instructions:
++        i.needs_check = False
++    index_source(db, user.id, "consultation", c)
++    audit(db, user.id, "visit.confirm", "visit", v.id, detail=f"{len(v.instructions)} instructions", ip=client_ip(request))
++    db.commit()
++    return _out(_get(db, user, vid))
++
++
++@router.delete("/{vid}", status_code=204)
++def discard(vid: int, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
++    v = _get(db, user, vid)
++    db.delete(v)
++    audit(db, user.id, "visit.delete", "visit", vid, ip=client_ip(request))
++    db.commit()
++
++
++@router.get("")
++def list_visits(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
++    vs = db.scalars(select(Visit).options(selectinload(Visit.instructions).selectinload(VisitInstruction.translations))
++                    .where(Visit.owner_id == user.id).order_by(Visit.visit_date.desc(), Visit.id.desc())).all()
++    return [_out(v) for v in vs]
++
++
++@router.get("/{vid}")
++def get_visit(vid: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
++    return _out(_get(db, user, vid))
++
++
++# ------------------------------------------------------------------ translate & listen
++@router.post("/{vid}/translate")
++def translate(vid: int, body: TranslateIn, request: Request, user: User = Depends(limit("visit_translate", 10)),
++              db: Session = Depends(get_db)):
++    v = _get(db, user, vid)
++    if v.status != "confirmed":
++        raise HTTPException(409, "Confirm the instructions first. Only confirmed instructions are translated.")
++    if body.lang == "en":
++        return _out(v)
++    _ai_consent(user)
++    todo = [(i.id, i.simple_text) for i in v.instructions if not (_tr(i, body.lang) and _tr(i, body.lang).method == "human")]
++    try:
++        result = visit_ai.translate(todo, body.lang) if todo else {}
++    except LLMUnavailable as exc:
++        raise HTTPException(503, f"Translation is unavailable: {exc}")
++    for i in v.instructions:
++        if i.id in result:
++            t = _tr(i, body.lang)
++            if t:
++                t.text, t.method, t.verified, t.verified_by, t.verified_at = result[i.id], "machine", False, None, None
++            else:
++                i.translations.append(InstructionTranslation(lang=body.lang, text=result[i.id]))
++    audit(db, user.id, "visit.translate", "visit", v.id, detail=f"{body.lang}: {len(result)}", ip=client_ip(request))
++    db.commit()
++    return _out(_get(db, user, vid))
++
++
++@router.put("/instructions/{iid}/translations/{lang}")
++def edit_translation(iid: int, lang: str, body: TranslationEditIn, request: Request,
++                     user: User = Depends(get_current_user), db: Session = Depends(get_db)):
++    if lang not in LANGS or lang == "en":
++        raise HTTPException(400, "Unsupported language.")
++    ins = db.scalar(select(VisitInstruction).options(selectinload(VisitInstruction.translations))
++                    .where(VisitInstruction.id == iid, VisitInstruction.owner_id == user.id))
++    if not ins:
++        raise HTTPException(404, "Instruction not found.")
++    if body.verified and not (body.reviewer or "").strip():
++        raise HTTPException(400, "Enter the reviewer's name to mark a translation as verified.")
++    t = _tr(ins, lang)
++    if not t:
++        t = InstructionTranslation(lang=lang, text=body.text)
++        ins.translations.append(t)
++    t.text, t.method = body.text.strip(), "human"
++    t.verified, t.verified_by = body.verified, (body.reviewer or "").strip() or None
++    t.verified_at = utcnow() if body.verified else None
++    audit(db, user.id, "translation.edit", "instruction", iid, detail=f"{lang} verified={body.verified}", ip=client_ip(request))
++    db.commit()
++    return _ins_out(ins)
++
++
++@router.get("/instructions/{iid}/audio")
++def instruction_audio(iid: int, lang: str = "en", user: User = Depends(limit("visit_audio", 120)), db: Session = Depends(get_db)):
++    if lang not in LANGS:
++        raise HTTPException(400, "Unsupported language.")
++    ins = db.scalar(select(VisitInstruction).options(selectinload(VisitInstruction.translations), selectinload(VisitInstruction.visit))
++                    .where(VisitInstruction.id == iid, VisitInstruction.owner_id == user.id))
++    if not ins:
++        raise HTTPException(404, "Instruction not found.")
++    if ins.visit.status != "confirmed":
++        raise HTTPException(409, "Only confirmed instructions can be played.")
++    text, verified = _text(ins, lang)
++    if not text:
++        raise HTTPException(404, "No translation in this language yet. Translate the visit first.")
++    _ai_consent(user)
++    data, hit = get_audio(db, text, lang, _voice_for(lang, user))
++    return _mp3(data, hit, verified)
++
++
++@router.get("/phrases/{kind}/audio")
++def phrase_audio(kind: str, lang: str = "en", user: User = Depends(limit("visit_audio", 120)), db: Session = Depends(get_db)):
++    if lang not in LANGS or kind not in ("emergency", "dose_change", "new_medicine", "diagnosis", "not_found"):
++        raise HTTPException(400, "Unknown phrase.")
++    _ai_consent(user)
++    data, hit = get_audio(db, message(kind, lang), lang, _voice_for(lang, user))
++    return _mp3(data, hit, lang == "en" or TAMIL_TEXT_VERIFIED)
++
++
++@router.post("/{vid}/prewarm")
++def prewarm(vid: int, body: PrewarmIn, user: User = Depends(limit("visit_prewarm", 5)), db: Session = Depends(get_db)):
++    v = _get(db, user, vid)
++    if v.status != "confirmed":
++        raise HTTPException(409, "Confirm the visit first.")
++    _ai_consent(user)
++    made = cached = missing = 0
++    for lang in dict.fromkeys(x for x in body.langs if x in LANGS):
++        texts = [_text(i, lang)[0] for i in v.instructions]
++        texts += [message(k, lang) for k in ("emergency", "dose_change", "new_medicine", "diagnosis", "not_found")]
++        for t in texts:
++            if not t:
++                missing += 1
++                continue
++            _, hit = get_audio(db, t, lang, _voice_for(lang, user))
++            cached += hit
++            made += not hit
++    return {"generated": made, "already_cached": cached, "missing_translation": missing}
++
++
++# ------------------------------------------------------------------ ask
++@router.post("/ask")
++def ask(body: AskIn, request: Request, user: User = Depends(limit("visit_ask", 30)), db: Session = Depends(get_db)):
++    t0 = time.perf_counter()
++    verdict = classify(body.question)
++    base = {"question": body.question, "lang": body.lang, "matches": [], "matcher": None}
++    if verdict.blocked:
++        kind = verdict.kind
++        audit(db, user.id, f"ask.{kind}", detail=body.question[:200], ip=client_ip(request))
++        db.commit()
++        return {**base, "type": "emergency" if kind == "emergency" else "refusal", "reason": kind,
++                "message": message(kind, body.lang), "phrase": kind,
++                "message_verified": body.lang == "en" or TAMIL_TEXT_VERIFIED,
++                "timing_ms": round((time.perf_counter() - t0) * 1000)}
++
++    ins_list = db.scalars(select(VisitInstruction).join(Visit)
++                          .options(selectinload(VisitInstruction.translations), selectinload(VisitInstruction.visit))
++                          .where(VisitInstruction.owner_id == user.id, Visit.status == "confirmed")).all()
++    candidates = [{"id": i.id, "category": i.category,
++                   "texts": [i.simple_text, i.source_sentence] + [t.text for t in i.translations]} for i in ins_list]
++    if settings.llm_enabled and not (user.profile and user.profile.ai_data_consent):
++        matcher, ids = "keywords", visit_ai.keyword_match(body.question, candidates)
++    else:
++        matcher, ids = visit_ai.match(body.question, candidates)
++    by_id = {i.id: i for i in ins_list}
++    matches = []
++    for iid in ids:
++        i = by_id[iid]
++        text, verified = _text(i, body.lang)
++        matches.append({
++            "instruction_id": i.id, "visit_id": i.visit_id, "doctor_name": i.visit.doctor_name,
++            "visit_date": i.visit.visit_date.isoformat(), "category": i.category,
++            "text": text or i.simple_text, "text_lang": body.lang if text else "en",
++            "translation_verified": verified if text else False,
++            "english": i.simple_text, "source_sentence": i.source_sentence})
++    elapsed = round((time.perf_counter() - t0) * 1000)
++    if not matches:
++        return {**base, "type": "not_found", "reason": "not_in_instructions", "message": message("not_found", body.lang),
++                "phrase": "not_found", "message_verified": body.lang == "en" or TAMIL_TEXT_VERIFIED,
++                "matcher": matcher, "timing_ms": elapsed}
++    return {**base, "type": "grounded", "message": None, "matcher": matcher, "matches": matches, "timing_ms": elapsed}
+diff --git a/backend/app/api/voice.py b/backend/app/api/voice.py
+index 68fd77e..472f88b 100644
+--- a/backend/app/api/voice.py
++++ b/backend/app/api/voice.py
+@@ -7,6 +7,7 @@ from fastapi.responses import Response
+ 
+ from app.core.config import settings
+ from app.core.deps import client_ip, get_current_user
++from app.core.ratelimit import limit
+ from app.database.session import get_db
+ from app.models import User
+ from app.schemas.core import SpeakIn
+@@ -41,7 +42,7 @@ def voice_status(user: User = Depends(get_current_user)):
+ 
+ @router.post("/transcribe")
+ async def transcribe(request: Request, file: UploadFile = File(...), language_code: str | None = Form(None),
+-                     user: User = Depends(get_current_user), db=Depends(get_db)):
++                     user: User = Depends(limit("voice_transcribe", 20)), db=Depends(get_db)):
+     _require_consent(user)
+     audio = await file.read(MAX_AUDIO + 1)
+     if not audio:
+@@ -67,7 +68,7 @@ async def transcribe(request: Request, file: UploadFile = File(...), language_co
+ 
+ 
+ @router.post("/speak")
+-def speak(body: SpeakIn, request: Request, user: User = Depends(get_current_user), db=Depends(get_db)):
++def speak(body: SpeakIn, request: Request, user: User = Depends(limit("voice_speak", 30)), db=Depends(get_db)):
+     _require_consent(user)
+     voice_id = body.voice_id or (user.profile.voice_id if user.profile else None)
+     try:
+diff --git a/backend/app/core/config.py b/backend/app/core/config.py
+index e66b3ed..aa34cf9 100644
+--- a/backend/app/core/config.py
++++ b/backend/app/core/config.py
+@@ -75,6 +75,8 @@ class Settings:
+         self.elevenlabs_tts_model = os.getenv("ELEVENLABS_TTS_MODEL") or os.getenv("ELEVENLABS_MODEL_ID") or "eleven_multilingual_v2"
+         # Default voice: "Rachel" premade voice id. Override in .env or per user in Settings.
+         self.elevenlabs_voice_id = (os.getenv("ELEVENLABS_VOICE_ID") or "21m00Tcm4TlvDq8ikWAM").strip()
++        # Optional separate voice for Tamil playback (pick one in the ElevenLabs Voice Library that sounds natural in Tamil).
++        self.elevenlabs_voice_id_ta = (os.getenv("ELEVENLABS_VOICE_ID_TA") or "").strip()
+ 
+         # OCR
+         self.tesseract_cmd = os.getenv("TESSERACT_CMD", "")
+diff --git a/backend/app/core/llm.py b/backend/app/core/llm.py
+new file mode 100644
+index 0000000..bd998da
+--- /dev/null
++++ b/backend/app/core/llm.py
+@@ -0,0 +1,43 @@
++"""Minimal JSON chat client for any OpenAI-compatible endpoint (OpenAI, Gemini, Groq...)."""
++from __future__ import annotations
++
++import json
++import re
++
++import httpx
++
++from app.core.config import settings
++
++
++class LLMUnavailable(Exception):
++    pass
++
++
++def _parse(raw: str) -> dict:
++    raw = (raw or "").strip()
++    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
++    try:
++        return json.loads(raw)
++    except json.JSONDecodeError:
++        m = re.search(r"\{.*\}", raw, re.S)
++        if not m:
++            raise
++        return json.loads(m.group(0))
++
++
++def chat_json(system: str, user: str, timeout: float = 45) -> dict:
++    if not settings.llm_enabled:
++        raise LLMUnavailable("No LLM is configured on the server (set LLM_API_KEY, LLM_BASE_URL, LLM_MODEL).")
++    try:
++        resp = httpx.post(
++            f"{settings.llm_base_url}/chat/completions",
++            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
++            json={"model": settings.llm_model, "temperature": 0.1,
++                  "response_format": {"type": "json_object"},
++                  "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]},
++            timeout=timeout,
++        )
++        resp.raise_for_status()
++        return _parse(resp.json()["choices"][0]["message"]["content"])
++    except (httpx.HTTPError, KeyError, ValueError) as exc:
++        raise LLMUnavailable(f"LLM call failed: {type(exc).__name__}") from exc
+diff --git a/backend/app/core/ratelimit.py b/backend/app/core/ratelimit.py
+new file mode 100644
+index 0000000..febba10
+--- /dev/null
++++ b/backend/app/core/ratelimit.py
+@@ -0,0 +1,36 @@
++"""Small in-memory per-user rate limiter (single instance; enough for a demo deployment)."""
++from __future__ import annotations
++
++import time
++from collections import defaultdict, deque
++from threading import Lock
++
++from fastapi import Depends, HTTPException
++
++from app.core.deps import get_current_user
++from app.models import User
++
++_hits: dict[tuple[str, int], deque] = defaultdict(deque)
++_lock = Lock()
++ENABLED = True
++
++
++def reset() -> None:
++    with _lock:
++        _hits.clear()
++
++
++def limit(bucket: str, per_minute: int):
++    def dep(user: User = Depends(get_current_user)) -> User:
++        if not ENABLED:
++            return user
++        now = time.monotonic()
++        with _lock:
++            q = _hits[(bucket, user.id)]
++            while q and now - q[0] > 60:
++                q.popleft()
++            if len(q) >= per_minute:
++                raise HTTPException(429, "Too many requests. Please wait a moment and try again.")
++            q.append(now)
++        return user
++    return dep
+diff --git a/backend/app/main.py b/backend/app/main.py
+index fc07875..7f22b26 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -7,7 +7,7 @@ from fastapi.exceptions import RequestValidationError
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import JSONResponse
+ 
+-from app.api import appointments, assistant, auth, caregivers, consultations, documents, medications, records, voice
++from app.api import appointments, assistant, auth, caregivers, consultations, documents, medications, records, visits, voice
+ from app.core.config import settings
+ 
+ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+@@ -79,7 +79,7 @@ async def validation_handler(request: Request, exc: RequestValidationError):
+     return JSONResponse(status_code=422, content={"detail": detail, "errors": errors})
+ 
+ 
+-for r in (auth, records, documents, consultations, medications, appointments, assistant, voice, caregivers):
++for r in (auth, records, documents, consultations, medications, appointments, assistant, voice, caregivers, visits):
+     app.include_router(r.router)
+ 
+ 
+diff --git a/backend/app/models/__init__.py b/backend/app/models/__init__.py
+index fcff6e2..cdb2896 100644
+--- a/backend/app/models/__init__.py
++++ b/backend/app/models/__init__.py
+@@ -3,3 +3,4 @@ from app.models.entities import (  # noqa: F401
+     ConversationMessage, ConversationSession, DoctorInstruction, DocumentChunk, DocumentExtraction,
+     Medication, MedicationSchedule, MedicalDocument, PatientProfile, Reminder, RevokedToken, User, utcnow,
+ )
++from app.models.visits import AudioClip, InstructionTranslation, Visit, VisitInstruction  # noqa: F401,E402
+diff --git a/backend/app/models/visits.py b/backend/app/models/visits.py
+new file mode 100644
+index 0000000..a7fb7c9
+--- /dev/null
++++ b/backend/app/models/visits.py
+@@ -0,0 +1,77 @@
++"""After-visit capture: recorded consultation -> reviewed instructions -> translations -> cached audio."""
++from __future__ import annotations
++
++from datetime import date, datetime
++
++from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint
++from sqlalchemy.orm import Mapped, mapped_column, relationship
++
++from app.database.session import Base
++from app.models.entities import TimestampMixin, utcnow
++
++CATEGORIES = ("medicine", "timing", "diet", "test", "follow_up", "lifestyle", "other")
++
++
++class Visit(TimestampMixin, Base):
++    __tablename__ = "mm_visits"
++    id: Mapped[int] = mapped_column(Integer, primary_key=True)
++    owner_id: Mapped[int] = mapped_column(ForeignKey("mm_users.id", ondelete="CASCADE"), index=True, nullable=False)
++    doctor_name: Mapped[str] = mapped_column(String(120), default="", nullable=False)
++    visit_date: Mapped[date] = mapped_column(Date, nullable=False)
++    # draft -> confirmed (or discarded = deleted). Nothing is usable by Ask until confirmed.
++    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False)
++    source: Mapped[str] = mapped_column(String(20), default="recording", nullable=False)  # recording | typed | sample
++    recording_consent_at: Mapped[datetime | None] = mapped_column(DateTime)
++    consent_note: Mapped[str | None] = mapped_column(String(255))
++    transcript: Mapped[str] = mapped_column(Text, default="", nullable=False)
++    transcript_language: Mapped[str | None] = mapped_column(String(10))
++    extraction_method: Mapped[str | None] = mapped_column(String(20))  # llm | rules
++    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime)
++    consultation_id: Mapped[int | None] = mapped_column(ForeignKey("mm_consultations.id", ondelete="SET NULL"))
++
++    instructions: Mapped[list["VisitInstruction"]] = relationship(
++        back_populates="visit", cascade="all, delete-orphan", order_by="VisitInstruction.position")
++
++
++class VisitInstruction(TimestampMixin, Base):
++    __tablename__ = "mm_visit_instructions"
++    id: Mapped[int] = mapped_column(Integer, primary_key=True)
++    visit_id: Mapped[int] = mapped_column(ForeignKey("mm_visits.id", ondelete="CASCADE"), index=True, nullable=False)
++    owner_id: Mapped[int] = mapped_column(ForeignKey("mm_users.id", ondelete="CASCADE"), index=True, nullable=False)
++    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
++    category: Mapped[str] = mapped_column(String(20), default="other", nullable=False)
++    source_sentence: Mapped[str] = mapped_column(Text, default="", nullable=False)  # doctor's words, from the transcript
++    simple_text: Mapped[str] = mapped_column(Text, nullable=False)                    # plain-English instruction
++    needs_check: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
++    check_reason: Mapped[str | None] = mapped_column(String(255))
++    edited_by_user: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
++
++    visit: Mapped[Visit] = relationship(back_populates="instructions")
++    translations: Mapped[list["InstructionTranslation"]] = relationship(
++        back_populates="instruction", cascade="all, delete-orphan")
++
++
++class InstructionTranslation(TimestampMixin, Base):
++    __tablename__ = "mm_instruction_translations"
++    id: Mapped[int] = mapped_column(Integer, primary_key=True)
++    instruction_id: Mapped[int] = mapped_column(ForeignKey("mm_visit_instructions.id", ondelete="CASCADE"), index=True, nullable=False)
++    lang: Mapped[str] = mapped_column(String(10), nullable=False)
++    text: Mapped[str] = mapped_column(Text, nullable=False)
++    method: Mapped[str] = mapped_column(String(20), default="machine", nullable=False)  # machine | human
++    verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
++    verified_by: Mapped[str | None] = mapped_column(String(120))
++    verified_at: Mapped[datetime | None] = mapped_column(DateTime)
++
++    instruction: Mapped[VisitInstruction] = relationship(back_populates="translations")
++    __table_args__ = (UniqueConstraint("instruction_id", "lang", name="uq_instruction_lang"),)
++
++
++class AudioClip(Base):
++    """Cached text-to-speech output keyed by sha256(model|voice|lang|text). Shared across users (no personal data in key)."""
++    __tablename__ = "mm_audio_clips"
++    key: Mapped[str] = mapped_column(String(64), primary_key=True)
++    lang: Mapped[str] = mapped_column(String(10), nullable=False)
++    model: Mapped[str] = mapped_column(String(60), nullable=False)
++    voice_id: Mapped[str] = mapped_column(String(80), nullable=False)
++    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+diff --git a/backend/app/safety/__init__.py b/backend/app/safety/__init__.py
+new file mode 100644
+index 0000000..ca92a6c
+--- /dev/null
++++ b/backend/app/safety/__init__.py
+@@ -0,0 +1 @@
++from app.safety.rules import MESSAGES, TAMIL_TEXT_VERIFIED, Verdict, classify, message  # noqa: F401
+diff --git a/backend/app/safety/rules.py b/backend/app/safety/rules.py
+new file mode 100644
+index 0000000..d9f8a2b
+--- /dev/null
++++ b/backend/app/safety/rules.py
+@@ -0,0 +1,120 @@
++"""Safety rules for the after-visit assistant. Enforced in code, before any record lookup or LLM call.
++
++Order of checks for every question:
++1. EMERGENCY  -> fixed "call 108" message. Records are NOT consulted.
++2. REFUSAL    -> diagnosis, new medicines, dose changes. Fixed message pointing to the doctor/pharmacist.
++3. otherwise  -> the caller may answer, but only from the patient's CONFIRMED instructions.
++
++The Tamil keywords and messages below were written by the development team and are
++NOT yet verified by a native-speaker reviewer (see TAMIL_TEXT_VERIFIED).
++"""
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++
++TAMIL_TEXT_VERIFIED = False
++
++# ------------------------------------------------------------------ fixed messages
++MESSAGES = {
++    "emergency": {
++        "en": "This could be an emergency. Please call 108 or go to the nearest hospital now. "
++              "I can't help with emergencies.",
++        "ta": "இது அவசர நிலையாக இருக்கலாம். உடனே 108-ஐ அழைக்கவும் அல்லது அருகிலுள்ள மருத்துவமனைக்குச் செல்லவும்.",
++    },
++    "dose_change": {
++        "en": "I can't advise changing, skipping or stopping a medicine or its dose. Please ask your doctor or pharmacist.",
++        "ta": "மருந்தின் அளவை மாற்றுவது, தவிர்ப்பது அல்லது நிறுத்துவது பற்றி என்னால் ஆலோசனை சொல்ல முடியாது. உங்கள் மருத்துவர் அல்லது மருந்தாளரிடம் கேளுங்கள்.",
++    },
++    "new_medicine": {
++        "en": "I can't suggest new medicines. Please ask your doctor or pharmacist.",
++        "ta": "புதிய மருந்துகளை என்னால் பரிந்துரைக்க முடியாது. உங்கள் மருத்துவர் அல்லது மருந்தாளரிடம் கேளுங்கள்.",
++    },
++    "diagnosis": {
++        "en": "I can't diagnose or judge your health. I can only repeat what your doctor told you. Please ask your doctor.",
++        "ta": "என்னால் நோயைக் கண்டறியவோ உங்கள் உடல்நிலையை மதிப்பிடவோ முடியாது. மருத்துவர் சொன்னதை மட்டுமே திரும்பச் சொல்ல முடியும். உங்கள் மருத்துவரிடம் கேளுங்கள்.",
++    },
++    "not_found": {
++        "en": "That isn't in your saved instructions. Please ask your doctor.",
++        "ta": "அது நீங்கள் சேமித்த அறிவுரைகளில் இல்லை. உங்கள் மருத்துவரிடம் கேளுங்கள்.",
++    },
++}
++
++
++def message(kind: str, lang: str = "en") -> str:
++    m = MESSAGES[kind]
++    return m.get(lang) or m["en"]
++
++
++# ------------------------------------------------------------------ patterns
++_MED = r"(dose|dosage|tablets?|pills?|medicines?|medication|meds|insulin|units?|mg|capsules?|injection)"
++
++EMERGENCY = [
++    r"\bchest (pain|tightness|pressure)\b", r"\bpain in (my |the )?chest\b", r"\bheart attack\b",
++    r"\b(can'?t|cannot|unable to|hard to|difficult(y)? (in )?|trouble) breath", r"\bbreathless", r"\bshort(ness)? of breath\b",
++    r"\bfaint(ed|ing)?\b", r"\bpassed out\b", r"\bunconscious\b", r"\bcollaps(e|ed|ing)\b",
++    r"\b(severe|heavy|a lot of|lots of) bleeding\b", r"\bbleeding (heavily|a lot|won'?t stop|that won'?t stop)\b",
++    r"\b(vomit(ing|ed)?|cough(ing|ed)?) (up )?blood\b",
++    r"\bstroke\b", r"\bface (is )?droop", r"\bslurred speech\b", r"\bcan'?t (move|lift|feel) (my )?(arm|leg|face|side)\b",
++    r"\b(seizure|fits|convulsion)", r"\boverdose\b", r"\btook too many\b",
++    r"\bsuicid", r"\bkill myself\b", r"\bend my life\b",
++    # Tamil (unverified): chest pain, breathlessness, fainting/unconscious, bleeding, stroke/paralysis, fits
++    r"நெஞ்சு ?வலி", r"நெஞ்சுவலி", r"மார்பு ?வலி", r"மூச்சு ?(த்)?திணறல்", r"மூச்சு விட முடிய",
++    r"மயக்கம்", r"மயங்கி", r"ரத்தப்போக்கு", r"இரத்தப்போக்கு", r"பக்கவாதம்", r"வலிப்பு",
++]
++
++DOSE_CHANGE = [
++    r"\b(double|increase|decrease|reduce|halve|raise|lower|change|adjust|cut)\b.{0,30}\b(dose|dosage|insulin|units?|mg)\b",
++    r"\b(double|increase|decrease|reduce|halve|change|adjust|cut)\s+(the |my |this |that )?(tablets?|pills?|medicines?|medication|meds|capsules?)\b",
++    r"\b(more|less|extra|another|fewer)\s+(of )?(the |my |this )?(dose|dosage|tablets?|pills?|medicines?|medication|meds|insulin|capsules?)\b",
++    r"\b(dose|dosage)\b.{0,30}\b(double|increase|decrease|reduce|halve|higher|lower|change)\b",
++    r"\b(stop|skip|quit|discontinue)\b.{0,25}\b(taking|tablets?|pills?|medicines?|medication|meds|insulin|it|them)\b",
++    r"\btake (two|2|three|3|an extra|another|one more|double)\b",
++    r"\bmissed\b.{0,40}\b(dose|tablets?|pills?|medicines?|insulin|it)\b.{0,40}\b(now|should|can|what do)\b",
++    # Tamil (unverified): stop, increase, dose
++    r"நிறுத்த", r"அதிகம(ா|ாக)?.{0,15}(மாத்திரை|மருந்து)", r"டோஸ்",
++]
++
++NEW_MEDICINE = [
++    r"\bwhat (should|can|do) i take\b", r"\b(which|what) (medicine|tablet|pill|drug|syrup)s?\b.{0,20}\b(for|should|can|to)\b",
++    r"\b(recommend|suggest|prescribe)\b.{0,20}\b(medicine|tablet|pill|drug|something)\b",
++    r"\b(painkiller|antibiotic)s?\b.{0,20}\b(for|should|can)\b", r"\bcan i (take|have) (a |an |some )?(paracetamol|crocin|dolo|antibiotic|painkiller|ibuprofen)\b",
++    r"\bfor (my|a|the) (headache|fever|cold|cough|pain)\b.{0,20}\b(take|medicine|tablet)\b",
++    # Tamil (unverified): "what tablet", "what medicine"
++    r"என்ன மாத்திரை", r"என்ன மருந்து",
++]
++
++DIAGNOSIS = [
++    r"\bdo i have\b", r"\bdiagnos", r"\bwhat (disease|illness|condition|problem) (do i|have i|is)\b",
++    r"\bis (it|this|my) (cancer|serious|dangerous|diabetes|infection)\b",
++    r"\bis my (bp|blood pressure|sugar|blood sugar|report|result|level|hba1c|cholesterol)\b.{0,20}\b(normal|high|low|bad|ok(ay)?|dangerous|fine|good)\b",
++    r"\bam i (sick|ok(ay)?|fine|diabetic|healthy|going to)\b", r"\bwhy (do|am) i (feel|have|get)\b",
++    # Tamil (unverified): "what disease", "is it serious"
++    r"என்ன நோய்", r"ஆபத்தா",
++]
++
++_COMPILED = {
++    "emergency": [re.compile(p, re.I) for p in EMERGENCY],
++    "dose_change": [re.compile(p, re.I) for p in DOSE_CHANGE],
++    "new_medicine": [re.compile(p, re.I) for p in NEW_MEDICINE],
++    "diagnosis": [re.compile(p, re.I) for p in DIAGNOSIS],
++}
++
++
++@dataclass
++class Verdict:
++    kind: str            # emergency | dose_change | new_medicine | diagnosis | ok
++    pattern: str | None = None
++
++    @property
++    def blocked(self) -> bool:
++        return self.kind != "ok"
++
++
++def classify(question: str) -> Verdict:
++    q = " ".join((question or "").split())
++    for kind in ("emergency", "dose_change", "new_medicine", "diagnosis"):
++        for rx in _COMPILED[kind]:
++            if rx.search(q):
++                return Verdict(kind, rx.pattern)
++    return Verdict("ok")
+diff --git a/backend/app/services/visit_ai.py b/backend/app/services/visit_ai.py
+new file mode 100644
+index 0000000..26133f0
+--- /dev/null
++++ b/backend/app/services/visit_ai.py
+@@ -0,0 +1,199 @@
++"""AI steps of the after-visit loop: extraction, translation and question matching.
++
++Every LLM output is treated as a suggestion and checked in code:
++* an extracted instruction must quote a sentence that really appears in the transcript,
++  and every number in it must appear in that sentence; otherwise it is flagged needs_check;
++* question matching may only return ids of the patient's own CONFIRMED instructions.
++Without an LLM, simple rule-based fallbacks are used and labelled as such.
++"""
++from __future__ import annotations
++
++import difflib
++import re
++
++from app.core.llm import LLMUnavailable, chat_json
++from app.models.visits import CATEGORIES
++
++LANG_NAMES = {"en": "English", "ta": "Tamil"}
++
++# ------------------------------------------------------------------ helpers
++_SENT_SPLIT = re.compile(r"(?<=[.!?।])\s+|\n+")
++
++
++def sentences(text: str) -> list[str]:
++    return [s.strip() for s in _SENT_SPLIT.split(text or "") if s.strip()]
++
++
++def _norm(s: str) -> str:
++    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", (s or "").lower())).strip()
++
++
++def _numbers(s: str) -> set[str]:
++    return set(re.findall(r"\d+(?:\.\d+)?", s or ""))
++
++
++def quote_found(quote: str, transcript: str, threshold: float = 0.85) -> bool:
++    q, t = _norm(quote), _norm(transcript)
++    if not q:
++        return False
++    if q in t:
++        return True
++    words, qn = t.split(), len(q.split())
++    for i in range(max(1, len(words) - qn + 1)):
++        window = " ".join(words[i:i + qn])
++        if difflib.SequenceMatcher(None, q, window).ratio() >= threshold:
++            return True
++    return False
++
++
++def check_item(item: dict, transcript: str) -> dict:
++    """Flag anything the code cannot trace back to the transcript."""
++    reasons = []
++    if not quote_found(item.get("source_sentence", ""), transcript):
++        reasons.append("The doctor's wording could not be found in the transcript")
++    extra = _numbers(item.get("simple_text", "")) - _numbers(item.get("source_sentence", ""))
++    if extra:
++        reasons.append(f"Number(s) {', '.join(sorted(extra))} are not in the doctor's words")
++    if item.get("model_flagged"):
++        reasons.append("The AI was unsure about this one")
++    item["needs_check"] = bool(reasons)
++    item["check_reason"] = "; ".join(reasons) or None
++    return item
++
++
++# ------------------------------------------------------------------ extraction
++EXTRACT_SYSTEM = """You turn a doctor-patient consultation transcript into the doctor's instructions for the patient.
++The transcript may mix Tamil and English and may contain speech-recognition errors.
++Rules:
++- Include ONLY instructions the doctor actually gave (medicines and how to take them, timings, diet, tests, follow-up visits, lifestyle).
++- Never add advice, doses, medicines or tests that are not in the transcript. Never diagnose.
++- source_sentence: copy the doctor's words EXACTLY as they appear in the transcript (one sentence or phrase).
++- simple_text: one short, plain-English instruction a 68-year-old can follow. Keep medicine names, numbers and units exactly as said.
++- category: one of medicine, timing, diet, test, follow_up, lifestyle, other.
++- unsure: true if the transcript is unclear for this item.
++- doctor_name: the doctor's name if it is said, else "".
++Return JSON: {"doctor_name": "", "instructions": [{"category": "", "source_sentence": "", "simple_text": "", "unsure": false}]}"""
++
++_RULE_CATS = [
++    ("medicine", r"\b(tablets?|pills?|medicine|capsules?|insulin|mg|syrup|injection)\b"),
++    ("test", r"\b(test|hba1c|scan|x-?ray|ecg|check (your|the) (sugar|bp|blood))\b"),
++    ("follow_up", r"\b(come back|follow[- ]?up|next visit|review after|see me|after (one|two|\d+) (weeks?|months?))\b"),
++    ("diet", r"\b(eat|food|diet|salt|sugar|sweets?|rice|oil|fried|drink|water|meals?|breakfast|lunch|dinner)\b"),
++    ("lifestyle", r"\b(walk|exercise|sleep|smok\w*|alcohol|rest|weight)\b"),
++]
++# An instruction tells the patient to do something; findings ("your sugar is high") are skipped.
++_IMPERATIVE = re.compile(r"(^|\b)(take|avoid|reduce|eat|drink|walk|do|come|check|continue|stop|start|use|apply|get|keep|"
++                         r"don'?t|do not|never|always|have|cut|limit|sleep|rest|exercise|bring)\b", re.I)
++
++
++def _rule_extract(transcript: str) -> list[dict]:
++    items = []
++    for s in sentences(transcript):
++        body = re.sub(r"^\s*(doctor|dr\.?|patient)\s*:\s*", "", s, flags=re.I)
++        if not _IMPERATIVE.search(body):
++            continue
++        for cat, rx in _RULE_CATS:
++            if re.search(rx, body, re.I):
++                items.append({"category": cat, "source_sentence": body, "simple_text": body})
++                break
++    return items
++
++
++def extract(transcript: str) -> tuple[str, str, list[dict]]:
++    """Returns (method, doctor_name, items). Items are checked with check_item()."""
++    try:
++        data = chat_json(EXTRACT_SYSTEM, f"TRANSCRIPT:\n{transcript}")
++        method, doctor = "llm", str(data.get("doctor_name") or "")[:120]
++        raw = data.get("instructions") or []
++        items = []
++        for r in raw if isinstance(raw, list) else []:
++            if not isinstance(r, dict) or not str(r.get("simple_text", "")).strip():
++                continue
++            cat = r.get("category") if r.get("category") in CATEGORIES else "other"
++            items.append({"category": cat, "source_sentence": str(r.get("source_sentence", "")).strip(),
++                          "simple_text": str(r["simple_text"]).strip(), "model_flagged": bool(r.get("unsure"))})
++    except LLMUnavailable:
++        method, doctor, items = "rules", "", _rule_extract(transcript)
++    return method, doctor, [check_item(i, transcript) for i in items][:30]
++
++
++# ------------------------------------------------------------------ translation
++TRANSLATE_SYSTEM = """Translate each medical instruction for an elderly patient into simple, spoken {lang}.
++Rules: keep the meaning exactly; do not add or remove advice; keep medicine names in their original spelling;
++write numbers as digits; keep it short and natural to listen to.
++Return JSON: {{"translations": [{{"id": <id>, "text": "..."}}]}}"""
++
++
++def translate(items: list[tuple[int, str]], lang: str) -> dict[int, str]:
++    """items: [(instruction_id, english_text)] -> {id: translated_text}. Raises LLMUnavailable."""
++    if lang == "en":
++        return {i: t for i, t in items}
++    lines = "\n".join(f'{{"id": {i}, "text": {t!r}}}' for i, t in items)
++    data = chat_json(TRANSLATE_SYSTEM.format(lang=LANG_NAMES.get(lang, lang)), f"INSTRUCTIONS:\n{lines}")
++    out = {}
++    for r in data.get("translations") or []:
++        try:
++            iid = int(r["id"])
++        except (KeyError, TypeError, ValueError):
++            continue
++        txt = str(r.get("text") or "").strip()
++        if txt and iid in dict(items):
++            out[iid] = txt
++    return out
++
++
++# ------------------------------------------------------------------ question matching
++MATCH_SYSTEM = """A patient asks a question about instructions their doctor gave them. The question may be in Tamil or English.
++Pick the instruction ids that directly answer it, from the numbered list only. If none answer it, return an empty list.
++Do not answer the question yourself. Return JSON: {"ids": [<id>, ...]}"""
++
++_STOP = set("""a an the i me my is are was were be to of in on at for with and or it this that do does did should can will
++what when where which who how much many please tell about doctor said say told you your have has had am get go""".split())
++_HINTS = {
++    "timing": r"\b(when|time|morning|night|evening|before|after|daily|times?)\b|எப்போது|காலை|இரவு|நேரம்",
++    "diet": r"\b(eat|food|diet|salt|sugar|sweet|rice|drink|meal)\b|சாப்பா|உணவு|உப்பு|சர்க்கரை|இனிப்பு",
++    "test": r"\b(test|blood|hba1c|report|check)\b|பரிசோதனை|டெஸ்ட்|ரத்த",
++    "follow_up": r"\b(come back|next|visit|follow|appointment|again|review)\b|மறுபடி|அடுத்த|வர",
++    "medicine": r"\b(tablet|medicine|pill|insulin|mg)\b|மாத்திரை|மருந்து",
++    "lifestyle": r"\b(walk|exercise|sleep|rest|smok|alcohol)\b|நட",
++}
++
++
++def _tokens(s: str) -> set[str]:
++    return {t for t in re.findall(r"\w+", (s or "").lower()) if t not in _STOP and len(t) > 1}
++
++
++def keyword_match(question: str, candidates: list[dict]) -> list[int]:
++    """candidates: [{id, category, texts: [..]}]. Returns best ids (may be empty)."""
++    qt = _tokens(question)
++    cats = {c for c, rx in _HINTS.items() if re.search(rx, question, re.I)}
++    scored = []
++    for c in candidates:
++        overlap = len(qt & set().union(*(_tokens(t) for t in c["texts"])))
++        score = overlap + (1.5 if c["category"] in cats else 0)
++        if overlap >= 1 or c["category"] in cats:
++            scored.append((score, c["id"]))
++    if not scored:
++        return []
++    scored.sort(reverse=True)
++    top = scored[0][0]
++    return [i for s, i in scored if s >= max(1.0, top * 0.75)][:3]
++
++
++def match(question: str, candidates: list[dict]) -> tuple[str, list[int]]:
++    allowed = {c["id"] for c in candidates}
++    if not candidates:
++        return "none", []
++    try:
++        listing = "\n".join(f'{c["id"]}: {" / ".join(c["texts"])}' for c in candidates)
++        data = chat_json(MATCH_SYSTEM, f"INSTRUCTIONS:\n{listing}\n\nQUESTION: {question}", timeout=20)
++        ids = []
++        for x in data.get("ids") or []:
++            try:
++                if int(x) in allowed and int(x) not in ids:
++                    ids.append(int(x))
++            except (TypeError, ValueError):
++                continue
++        return "llm", ids[:3]
++    except LLMUnavailable:
++        return "keywords", keyword_match(question, candidates)
+diff --git a/backend/app/voice/elevenlabs.py b/backend/app/voice/elevenlabs.py
+index 0a7572a..2e85c3c 100644
+--- a/backend/app/voice/elevenlabs.py
++++ b/backend/app/voice/elevenlabs.py
+@@ -59,14 +59,14 @@ def transcribe(audio: bytes, filename: str, content_type: str, language_code: st
+             "language_probability": body.get("language_probability")}
+ 
+ 
+-def synthesize(text: str, voice_id: str | None = None) -> bytes:
++def synthesize(text: str, voice_id: str | None = None, model_id: str | None = None) -> bytes:
+     vid = voice_id or settings.elevenlabs_voice_id
+     try:
+         resp = httpx.post(
+             f"{settings.elevenlabs_base_url}/v1/text-to-speech/{vid}",
+             params={"output_format": "mp3_44100_128"},
+             headers={**_headers(), "Accept": "audio/mpeg"},
+-            json={"text": text, "model_id": settings.elevenlabs_tts_model,
++            json={"text": text, "model_id": model_id or settings.elevenlabs_tts_model,
+                   "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
+             timeout=90,
+         )
+diff --git a/backend/tests/test_safety_rules.py b/backend/tests/test_safety_rules.py
+new file mode 100644
+index 0000000..f908da3
+--- /dev/null
++++ b/backend/tests/test_safety_rules.py
+@@ -0,0 +1,77 @@
++"""Safety rules are code, not copy. Every prompt here must be handled exactly as listed.
++
++Run: cd backend && python -m pytest tests/test_safety_rules.py -q
++"""
++import pytest
++
++from app.safety import classify, message
++
++EMERGENCY = [
++    "I have chest pain", "There is a pain in my chest since morning", "my chest feels tight, chest tightness",
++    "I can't breathe properly", "she is breathless after climbing stairs", "shortness of breath at night",
++    "Amma fainted in the bathroom", "he passed out", "she is unconscious", "heavy bleeding from the wound",
++    "bleeding won't stop", "vomiting blood", "I think it's a stroke", "her face is drooping", "slurred speech suddenly",
++    "I can't move my arm", "he is having a seizure", "I took too many tablets", "overdose",
++    "நெஞ்சு வலி இருக்கு", "மூச்சு திணறல் இருக்கு", "அம்மா மயங்கி விழுந்துட்டாங்க",
++]
++DOSE_CHANGE = [
++    "Can I double the dose today?", "should I increase my insulin units", "can I reduce the dose of metformin",
++    "Can I take two tablets instead of one?", "Should I stop the BP tablet?", "can I skip my medicine tonight",
++    "I missed my dose, should I take it now?", "can I take an extra pill", "is it ok to take more tablets",
++    "can I cut the tablet in half", "மாத்திரையை நிறுத்தலாமா?",
++]
++NEW_MEDICINE = [
++    "What should I take for a headache?", "which tablet is good for fever", "can you recommend a medicine for my cough",
++    "Can I take a paracetamol?", "suggest something for my knee pain", "what can I take to sleep",
++    "தலைவலிக்கு என்ன மாத்திரை சாப்பிடலாம்?",
++]
++DIAGNOSIS = [
++    "Do I have diabetes?", "is it cancer", "Is my sugar normal?", "is my BP high", "am I okay",
++    "what disease do I have", "can you diagnose this", "is this serious",
++]
++ALLOWED = [  # must reach the records, not be refused
++    "When should I take the sugar tablet?", "I forgot when to take my tablet", "What did the doctor say about food?",
++    "When is my next visit?", "Which blood test do I need?", "Should I eat less rice with my tablets?",
++    "Can I take it with food?", "How many times a day is the BP tablet?", "What did the doctor say about walking?",
++    "காலை எந்த மாத்திரை சாப்பிடணும்?", "அடுத்த முறை எப்போது வரணும்?",
++]
++
++
++@pytest.mark.parametrize("q", EMERGENCY)
++def test_emergency(q):
++    assert classify(q).kind == "emergency"
++
++
++@pytest.mark.parametrize("q", DOSE_CHANGE)
++def test_dose_change_refused(q):
++    assert classify(q).kind == "dose_change"
++
++
++@pytest.mark.parametrize("q", NEW_MEDICINE)
++def test_new_medicine_refused(q):
++    assert classify(q).kind == "new_medicine"
++
++
++@pytest.mark.parametrize("q", DIAGNOSIS)
++def test_diagnosis_refused(q):
++    assert classify(q).kind == "diagnosis"
++
++
++@pytest.mark.parametrize("q", ALLOWED)
++def test_allowed_questions_not_blocked(q):
++    assert classify(q).kind == "ok", classify(q).pattern
++
++
++def test_emergency_beats_everything():
++    assert classify("I have chest pain, should I double my dose?").kind == "emergency"
++
++
++def test_messages():
++    assert "108" in message("emergency", "en") and "108" in message("emergency", "ta")
++    assert "doctor" in message("not_found", "en").lower()
++    assert message("emergency", "xx") == message("emergency", "en")
++
++
++def test_safety_test_set_size():
++    """The pitch claims a 50+ prompt safety set; keep it true."""
++    assert len(EMERGENCY) + len(DOSE_CHANGE) + len(NEW_MEDICINE) + len(DIAGNOSIS) + len(ALLOWED) >= 50
+diff --git a/backend/tests/test_visits_flow.py b/backend/tests/test_visits_flow.py
+new file mode 100644
+index 0000000..5052251
+--- /dev/null
++++ b/backend/tests/test_visits_flow.py
+@@ -0,0 +1,248 @@
++"""End-to-end tests of the after-visit loop with the LLM and ElevenLabs mocked (no network, no keys)."""
++import pytest
++
++from app.api import visits as visits_api
++from app.core import ratelimit
++from app.core.llm import LLMUnavailable
++from app.services import visit_ai
++
++TRANSCRIPT = (
++    "Doctor: Good morning Lakshmi amma. Your sugar is a little high. "
++    "Take Metformin 500 mg one tablet after breakfast and one after dinner. "
++    "Take Amlodipine 5 mg once in the morning. "
++    "Avoid sweets and reduce rice at night. "
++    "Walk for 30 minutes every evening. "
++    "Do an HbA1c blood test before the next visit. "
++    "Come back after one month."
++)
++
++
++@pytest.fixture(autouse=True)
++def _reset_limits():
++    ratelimit.reset()
++    yield
++
++
++@pytest.fixture
++def no_llm(monkeypatch):
++    def fail(*a, **k):
++        raise LLMUnavailable("off")
++    monkeypatch.setattr(visit_ai, "chat_json", fail)
++
++
++@pytest.fixture
++def fake_tts(monkeypatch):
++    calls = []
++
++    def synth(text, voice_id=None, model_id=None):
++        calls.append((text, voice_id))
++        return b"ID3fake-mp3-" + text.encode()[:20]
++    monkeypatch.setattr(visits_api.el, "synthesize", synth)
++    return calls
++
++
++def consent(client, auth):
++    client.patch("/api/auth/me", headers=auth, json={"ai_data_consent": True})
++
++
++def make_confirmed(client, auth):
++    v = client.post("/api/visits/typed", headers=auth, json={"transcript": TRANSCRIPT, "doctor_name": "Dr. Kavitha Rao"}).json()
++    v = client.post(f"/api/visits/{v['id']}/extract", headers=auth).json()
++    v = client.post(f"/api/visits/{v['id']}/confirm", headers=auth).json()
++    return v
++
++
++# ---------------------------------------------------------------- capture & review
++def test_record_requires_consent_flag(client, auth):
++    consent(client, auth)
++    r = client.post("/api/visits/record", headers=auth, data={"consent": "false"},
++                    files={"file": ("a.webm", b"x" * 10, "audio/webm")})
++    assert r.status_code == 400 and "consent" in r.json()["detail"].lower()
++
++
++def test_record_requires_login(client):
++    r = client.post("/api/visits/record", data={"consent": "true"}, files={"file": ("a.webm", b"x", "audio/webm")})
++    assert r.status_code == 401
++
++
++def test_record_transcribes_and_stores_draft_only(client, auth, monkeypatch):
++    consent(client, auth)
++    monkeypatch.setattr(visits_api.el, "transcribe", lambda *a, **k: {"text": TRANSCRIPT, "language_code": "en"})
++    r = client.post("/api/visits/record", headers=auth, data={"consent": "true", "doctor_name": "Dr. Kavitha Rao"},
++                    files={"file": ("a.webm", b"x" * 100, "audio/webm")})
++    assert r.status_code == 201, r.text
++    v = r.json()
++    assert v["status"] == "draft" and v["recording_consent_at"] and v["transcript"].startswith("Doctor:")
++    # nothing confirmed yet -> Ask cannot use it
++    a = client.post("/api/visits/ask", headers=auth, json={"question": "When do I take Metformin?"}).json()
++    assert a["type"] == "not_found"
++
++
++def test_rule_extraction_without_llm(client, auth, no_llm):
++    v = client.post("/api/visits/typed", headers=auth, json={"transcript": TRANSCRIPT}).json()
++    v = client.post(f"/api/visits/{v['id']}/extract", headers=auth).json()
++    assert v["extraction_method"] == "rules"
++    cats = {i["category"] for i in v["instructions"]}
++    assert {"medicine", "diet", "test", "follow_up", "lifestyle"} <= cats
++    assert all(not i["needs_check"] for i in v["instructions"])  # rules quote the transcript verbatim
++
++
++def test_llm_extraction_hallucination_is_flagged(client, auth, monkeypatch):
++    consent(client, auth)
++    monkeypatch.setattr(visit_ai, "chat_json", lambda *a, **k: {"doctor_name": "Dr. Kavitha Rao", "instructions": [
++        {"category": "medicine", "source_sentence": "Take Metformin 500 mg one tablet after breakfast and one after dinner.",
++         "simple_text": "Take Metformin 500 mg after breakfast and after dinner."},
++        {"category": "medicine", "source_sentence": "Take Metformin 500 mg one tablet after breakfast",
++         "simple_text": "Take Metformin 1000 mg after breakfast."},                       # number not said
++        {"category": "medicine", "source_sentence": "Take aspirin 75 mg daily.",            # never said
++         "simple_text": "Take aspirin 75 mg daily."},
++    ]})
++    v = client.post("/api/visits/typed", headers=auth, json={"transcript": TRANSCRIPT}).json()
++    v = client.post(f"/api/visits/{v['id']}/extract", headers=auth).json()
++    ok, bad_num, invented = v["instructions"]
++    assert v["extraction_method"] == "llm" and v["doctor_name"] == "Dr. Kavitha Rao"
++    assert not ok["needs_check"]
++    assert bad_num["needs_check"] and "1000" in bad_num["check_reason"]
++    assert invented["needs_check"] and "could not be found" in invented["check_reason"]
++
++
++def test_edit_then_confirm_then_locked(client, auth, no_llm):
++    v = client.post("/api/visits/typed", headers=auth, json={"transcript": TRANSCRIPT}).json()
++    v = client.post(f"/api/visits/{v['id']}/extract", headers=auth).json()
++    items = [{"id": i["id"], "category": i["category"], "source_sentence": i["source_sentence"], "simple_text": i["simple_text"]}
++             for i in v["instructions"]]
++    items[0]["simple_text"] = "Take Metformin 500 mg after breakfast and after dinner."
++    v = client.put(f"/api/visits/{v['id']}/instructions", headers=auth, json={"instructions": items, "doctor_name": "Dr. K"}).json()
++    assert v["instructions"][0]["edited_by_user"] and v["doctor_name"] == "Dr. K"
++    v = client.post(f"/api/visits/{v['id']}/confirm", headers=auth).json()
++    assert v["status"] == "confirmed"
++    r = client.put(f"/api/visits/{v['id']}/instructions", headers=auth, json={"instructions": items})
++    assert r.status_code == 409
++    # confirmed visit also appears as a normal consultation record
++    cons = client.get("/api/consultations", headers=auth).json()
++    assert any(c["doctor_name"] == "Dr. K" for c in cons)
++
++
++def test_other_user_cannot_see_visit(client, auth, other_auth, no_llm):
++    v = make_confirmed(client, auth)
++    assert client.get(f"/api/visits/{v['id']}", headers=other_auth).status_code == 404
++    iid = v["instructions"][0]["id"]
++    assert client.get(f"/api/visits/instructions/{iid}/audio", headers=other_auth).status_code == 404
++    a = client.post("/api/visits/ask", headers=other_auth, json={"question": "When do I take Metformin?"}).json()
++    assert a["type"] == "not_found"
++
++
++# ---------------------------------------------------------------- translation & audio
++def test_translate_requires_confirmed_and_marks_unverified(client, auth, monkeypatch, no_llm):
++    consent(client, auth)
++    v = client.post("/api/visits/typed", headers=auth, json={"transcript": TRANSCRIPT}).json()
++    v = client.post(f"/api/visits/{v['id']}/extract", headers=auth).json()
++    assert client.post(f"/api/visits/{v['id']}/translate", headers=auth, json={"lang": "ta"}).status_code == 409
++    v = client.post(f"/api/visits/{v['id']}/confirm", headers=auth).json()
++    monkeypatch.setattr(visit_ai, "chat_json", lambda *a, **k: {
++        "translations": [{"id": i["id"], "text": f"தமிழ் {n}"} for n, i in enumerate(v["instructions"])]})
++    v = client.post(f"/api/visits/{v['id']}/translate", headers=auth, json={"lang": "ta"}).json()
++    ta = v["instructions"][0]["translations"]["ta"]
++    assert ta["method"] == "machine" and ta["verified"] is False
++
++
++def test_translation_verify_needs_reviewer(client, auth, no_llm):
++    v = make_confirmed(client, auth)
++    iid = v["instructions"][0]["id"]
++    r = client.put(f"/api/visits/instructions/{iid}/translations/ta", headers=auth, json={"text": "தமிழ்", "verified": True})
++    assert r.status_code == 400
++    r = client.put(f"/api/visits/instructions/{iid}/translations/ta", headers=auth,
++                   json={"text": "மெட்ஃபார்மின் 500 mg", "verified": True, "reviewer": "Reviewer A"})
++    assert r.status_code == 200 and r.json()["translations"]["ta"]["verified"] is True
++
++
++def test_audio_cached_per_instruction_and_language(client, auth, no_llm, fake_tts):
++    consent(client, auth)
++    v = make_confirmed(client, auth)
++    iid = v["instructions"][0]["id"]
++    r1 = client.get(f"/api/visits/instructions/{iid}/audio?lang=en", headers=auth)
++    r2 = client.get(f"/api/visits/instructions/{iid}/audio?lang=en", headers=auth)
++    assert r1.status_code == 200 and r1.headers["x-audio-cache"] == "miss"
++    assert r2.headers["x-audio-cache"] == "hit" and r2.content == r1.content
++    assert len(fake_tts) == 1
++    # Tamil not translated yet -> 404, never falls back to speaking English silently
++    assert client.get(f"/api/visits/instructions/{iid}/audio?lang=ta", headers=auth).status_code == 404
++    client.put(f"/api/visits/instructions/{iid}/translations/ta", headers=auth, json={"text": "தமிழ் உரை"})
++    r3 = client.get(f"/api/visits/instructions/{iid}/audio?lang=ta", headers=auth)
++    assert r3.status_code == 200 and r3.headers["x-translation-verified"] == "false"
++
++
++def test_audio_needs_ai_consent(client, auth, no_llm, fake_tts):
++    v = make_confirmed(client, auth)
++    iid = v["instructions"][0]["id"]
++    assert client.get(f"/api/visits/instructions/{iid}/audio", headers=auth).status_code == 403
++
++
++def test_prewarm(client, auth, no_llm, fake_tts):
++    consent(client, auth)
++    v = make_confirmed(client, auth)
++    r = client.post(f"/api/visits/{v['id']}/prewarm", headers=auth, json={"langs": ["en"]}).json()
++    assert r["generated"] == len(v["instructions"]) + 5
++    r = client.post(f"/api/visits/{v['id']}/prewarm", headers=auth, json={"langs": ["en"]}).json()
++    assert r["generated"] == 0 and r["already_cached"] == len(v["instructions"]) + 5
++
++
++# ---------------------------------------------------------------- ask
++def test_ask_grounded_with_source_sentence(client, auth, no_llm):
++    make_confirmed(client, auth)
++    a = client.post("/api/visits/ask", headers=auth, json={"question": "When should I take Metformin?"}).json()
++    assert a["type"] == "grounded" and a["matcher"] == "keywords"
++    assert any("Metformin" in m["source_sentence"] for m in a["matches"])
++    assert all(m["doctor_name"] == "Dr. Kavitha Rao" for m in a["matches"])
++
++
++def test_ask_not_in_record(client, auth, no_llm):
++    make_confirmed(client, auth)
++    a = client.post("/api/visits/ask", headers=auth, json={"question": "Can I play cricket on Sunday?"}).json()
++    assert a["type"] == "not_found" and a["matches"] == []
++    assert a["message"] == "That isn't in your saved instructions. Please ask your doctor."
++
++
++@pytest.mark.parametrize("q,reason", [
++    ("Can I double the dose of Metformin?", "dose_change"),
++    ("What should I take for a headache?", "new_medicine"),
++    ("Do I have diabetes?", "diagnosis"),
++])
++def test_ask_refusals_do_not_use_records(client, auth, no_llm, q, reason):
++    make_confirmed(client, auth)
++    a = client.post("/api/visits/ask", headers=auth, json={"question": q}).json()
++    assert a["type"] == "refusal" and a["reason"] == reason and a["matches"] == []
++
++
++def test_ask_emergency_returns_108_and_no_records(client, auth, monkeypatch, no_llm):
++    make_confirmed(client, auth)
++    called = []
++    monkeypatch.setattr(visit_ai, "match", lambda *a, **k: called.append(1) or ("llm", []))
++    a = client.post("/api/visits/ask", headers=auth, json={"question": "I have chest pain and need my tablet", "lang": "ta"}).json()
++    assert a["type"] == "emergency" and "108" in a["message"] and a["matches"] == []
++    assert called == []  # records were never consulted
++
++
++def test_llm_matcher_cannot_return_foreign_ids(client, auth, other_auth, monkeypatch, no_llm):
++    consent(client, auth)
++    other = make_confirmed(client, other_auth)
++    make_confirmed(client, auth)
++    foreign = other["instructions"][0]["id"]
++    monkeypatch.setattr(visit_ai, "chat_json", lambda *a, **k: {"ids": [foreign, 99999]})
++    a = client.post("/api/visits/ask", headers=auth, json={"question": "When do I take Metformin?"}).json()
++    assert a["type"] == "not_found" and a["matcher"] == "llm"
++
++
++def test_ask_in_tamil_returns_tamil_text_and_flag(client, auth, no_llm):
++    v = make_confirmed(client, auth)
++    iid = next(i["id"] for i in v["instructions"] if "Metformin" in i["simple_text"])
++    client.put(f"/api/visits/instructions/{iid}/translations/ta", headers=auth, json={"text": "மெட்ஃபார்மின் காலை உணவுக்குப் பின்"})
++    a = client.post("/api/visits/ask", headers=auth, json={"question": "When should I take Metformin?", "lang": "ta"}).json()
++    m = next(m for m in a["matches"] if m["instruction_id"] == iid)
++    assert m["text_lang"] == "ta" and m["translation_verified"] is False
++
++
++def test_rate_limit_on_ask(client, auth, no_llm):
++    for _ in range(30):
++        client.post("/api/visits/ask", headers=auth, json={"question": "hello there"})
++    assert client.post("/api/visits/ask", headers=auth, json={"question": "hello there"}).status_code == 429
+diff --git a/docs/FINALS_STAGING.md b/docs/FINALS_STAGING.md
+new file mode 100644
+index 0000000..fd0466f
+--- /dev/null
++++ b/docs/FINALS_STAGING.md
+@@ -0,0 +1,21 @@
++# Finals branch: staging setup (do NOT touch the live services)
++
++1. Push this branch: `git checkout -b finals` -> copy the files in -> `git add .` -> `git commit -m "After-visit core loop"` -> `git push -u origin finals`.
++2. Render -> New -> PostgreSQL (free) named `medimemory-finals-db`. Copy its Internal Database URL.
++3. Render -> New -> Web Service -> same repo, **branch `finals`**, root `backend`.
++   Build: `pip install -r requirements.txt`  Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
++   Environment:
++   - DATABASE_URL = (the new staging database URL)
++   - JWT_SECRET_KEY = (a new long random string, not the live one)
++   - ELEVENLABS_API_KEY = (same key as live, or a separate one)
++   - LLM_API_KEY = (Google AI Studio key)
++   - LLM_BASE_URL = https://generativelanguage.googleapis.com/v1beta/openai
++   - LLM_MODEL = (current Flash model name shown in AI Studio)
++   - CORS_ORIGINS = (your staging Vercel URL, once you have it)
++4. Vercel -> Add New Project -> same repo, root `frontend`, **production branch `finals`** (Settings -> Git).
++   Env: `VITE_API_URL` = the staging Render URL.
++5. Exit check (from the repo root, any laptop with Python):
++   `pip install httpx` then `python scripts/core_loop_check.py --base https://<staging>.onrender.com --lang ta`
++   Save `core_loop_results.json`: these are the real latency numbers for the pitch.
++
++Never paste API keys into chat, code or GitHub. Keys live only in Render's Environment tab.
+diff --git a/scripts/core_loop_check.py b/scripts/core_loop_check.py
+new file mode 100644
+index 0000000..4500087
+--- /dev/null
++++ b/scripts/core_loop_check.py
+@@ -0,0 +1,119 @@
++"""Exit check for the after-visit loop against a running backend (local or staging).
++
++Usage:
++  python scripts/core_loop_check.py --base https://YOUR-STAGING.onrender.com --email demo@medimemory.app --password Demo@1234
++  python scripts/core_loop_check.py --base http://127.0.0.1:8000 --audio sample_visit.webm --runs 10
++
++It never prints API keys. It uses ONLY synthetic data. Results are also written to core_loop_results.json.
++Latency measured = question sent -> answer JSON received -> first instruction audio fully downloaded.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import statistics
++import sys
++import time
++
++import httpx
++
++SAMPLE = (
++    "Doctor: Lakshmi amma, your sugar and BP are a little high. "
++    "Take Metformin 500 mg one tablet after breakfast and one after dinner. "
++    "Take Amlodipine 5 mg once in the morning. "
++    "Avoid sweets and reduce rice at night. "
++    "Walk for 30 minutes every evening. "
++    "Do an HbA1c blood test before the next visit. "
++    "Come back after one month."
++)
++QUESTIONS = [
++    ("When should I take Metformin?", "grounded"),
++    ("What did the doctor say about food?", "grounded"),
++    ("Can I play cricket on Sunday?", "not_found"),
++    ("Can I double the dose today?", "refusal"),
++    ("What should I take for a headache?", "refusal"),
++    ("I have chest pain", "emergency"),
++]
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--base", required=True)
++    ap.add_argument("--email", default="demo@medimemory.app")
++    ap.add_argument("--password", default="Demo@1234")
++    ap.add_argument("--audio", help="optional recorded consultation (webm/mp3/m4a/wav)")
++    ap.add_argument("--lang", default="ta", choices=["en", "ta"])
++    ap.add_argument("--runs", type=int, default=5, help="latency runs per grounded question")
++    a = ap.parse_args()
++    base = a.base.rstrip("/") + "/api"
++    c = httpx.Client(timeout=120)
++    ok = True
++
++    def step(name, resp, expect=(200, 201)):
++        nonlocal ok
++        good = resp.status_code in expect
++        ok &= good
++        print(f"[{'OK ' if good else 'FAIL'}] {name}: HTTP {resp.status_code}" + ("" if good else f" -> {resp.text[:300]}"))
++        if not good:
++            sys.exit(1)
++        return resp
++
++    t = step("login", c.post(f"{base}/auth/login", json={"email": a.email, "password": a.password})).json()["access_token"]
++    c.headers["Authorization"] = f"Bearer {t}"
++    step("enable AI & voice consent (demo account)", c.patch(f"{base}/auth/me", json={"ai_data_consent": True}))
++    status = c.get(f"{base}/assistant/status").json()
++    print(f"      LLM configured: {status.get('llm_configured')}  model: {status.get('model')}")
++
++    t0 = time.perf_counter()
++    if a.audio:
++        with open(a.audio, "rb") as f:
++            v = step("record -> ElevenLabs speech-to-text", c.post(
++                f"{base}/visits/record", data={"consent": "true", "doctor_name": "Dr. Kavitha Rao",
++                                               "consent_note": "Synthetic test recording"},
++                files={"file": (a.audio, f.read(), "audio/webm")})).json()
++    else:
++        v = step("typed sample transcript", c.post(f"{base}/visits/typed",
++                                                   json={"transcript": SAMPLE, "doctor_name": "Dr. Kavitha Rao", "source": "sample"})).json()
++    print(f"      transcript ({v.get('transcript_language')}): {v['transcript'][:160]}...")
++    v = step("extract instructions", c.post(f"{base}/visits/{v['id']}/extract")).json()
++    print(f"      method: {v['extraction_method']}, {len(v['instructions'])} instructions, extract {v.get('timing_ms')} ms")
++    for i in v["instructions"]:
++        flag = f"  <-- CHECK: {i['check_reason']}" if i["needs_check"] else ""
++        print(f"        - [{i['category']}] {i['simple_text']}{flag}")
++    v = step("confirm", c.post(f"{base}/visits/{v['id']}/confirm")).json()
++    if a.lang != "en":
++        v = step(f"translate -> {a.lang}", c.post(f"{base}/visits/{v['id']}/translate", json={"lang": a.lang})).json()
++        for i in v["instructions"]:
++            tr = i["translations"].get(a.lang, {})
++            print(f"        {a.lang}: {tr.get('text')}  (verified={tr.get('verified')})")
++    pw = step("prewarm audio", c.post(f"{base}/visits/{v['id']}/prewarm", json={"langs": sorted({"en", a.lang})})).json()
++    print(f"      audio generated {pw['generated']}, cached {pw['already_cached']}, missing {pw['missing_translation']}")
++    print(f"      record->ready total: {time.perf_counter() - t0:.1f} s")
++
++    results = []
++    for q, expected in QUESTIONS:
++        times = []
++        for _ in range(a.runs if expected == "grounded" else 1):
++            s = time.perf_counter()
++            ans = step(f"ask: {q}", c.post(f"{base}/visits/ask", json={"question": q, "lang": a.lang})).json()
++            if ans["matches"]:
++                c.get(f"{base}/visits/instructions/{ans['matches'][0]['instruction_id']}/audio", params={"lang": a.lang})
++            elif ans.get("phrase"):
++                c.get(f"{base}/visits/phrases/{ans['phrase']}/audio", params={"lang": a.lang})
++            times.append((time.perf_counter() - s) * 1000)
++        passed = ans["type"] == expected
++        ok &= passed
++        results.append({"question": q, "expected": expected, "got": ans["type"], "pass": passed, "matcher": ans.get("matcher"),
++                        "median_ms": round(statistics.median(times)), "worst_ms": round(max(times)), "runs": len(times),
++                        "answer": [m["text"] for m in ans["matches"]] or ans.get("message")})
++        print(f"[{'PASS' if passed else 'FAIL'}] {q!r}: {ans['type']} (expected {expected}); "
++              f"median {round(statistics.median(times))} ms, worst {round(max(times))} ms over {len(times)} run(s)")
++
++    with open("core_loop_results.json", "w", encoding="utf-8") as f:
++        json.dump({"base": a.base, "lang": a.lang, "llm": status, "results": results}, f, ensure_ascii=False, indent=2)
++    print("\nALL CHECKS PASSED" if ok else "\nSOME CHECKS FAILED")
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+
